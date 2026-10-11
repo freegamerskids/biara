@@ -1,0 +1,8 @@
+# Toolchain locations produced by scripts/fetch-deps.sh and
+# scripts/build-libtcg.sh (versions pinned in scripts/versions.sh).
+[env]
+LLVM_SYS_231_PREFIX = { value = ".deps/llvm-sys-23.1.2", relative = true }
+LIBCLANG_PATH = { value = ".deps/llvm-23.1.2/lib", relative = true }
+BIARA_LIBTCG_DIR = { value = ".deps/out", relative = true }
+# Cross-compiles the AArch64 test corpus (crates/biara-lift/tests/aarch64.rs).
+BIARA_CLANG = { value = ".deps/llvm-23.1.2/bin/clang", relative = true }

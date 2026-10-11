@@ -1,0 +1,68 @@
+diff -r a/accel/tcg/translator.c b/accel/tcg/translator.c
+--- a/accel/tcg/translator.c	2026-10-03 15:54:54.461326131 +0200
++++ b/accel/tcg/translator.c	2026-10-03 15:55:06.104081955 +0200
+@@ -247,6 +247,8 @@
+     }
+ }
+ 
++bool (*libtcg_code_read)(void *dest, vaddr pc, size_t len);
++
+ static bool translator_ld(CPUArchState *env, DisasContextBase *db,
+                           void *dest, vaddr pc, size_t len)
+ {
+@@ -255,6 +257,10 @@
+     void *host;
+     vaddr base;
+ 
++    if (libtcg_code_read) {
++        return libtcg_code_read(dest, pc, len);
++    }
++
+     /* Use slow path if first page is MMIO. */
+     if (unlikely(tb_page_addr0(tb) == -1)) {
+         /* We capped translation with first page MMIO in tb_gen_code. */
+diff -r a/include/exec/translator.h b/include/exec/translator.h
+--- a/include/exec/translator.h	2026-10-03 15:54:54.462051332 +0200
++++ b/include/exec/translator.h	2026-10-03 15:54:59.168096495 +0200
+@@ -279,4 +279,13 @@
+  */
+ bool translator_is_same_page(const DisasContextBase *db, vaddr addr);
+ 
++/**
++ * libtcg_code_read
++ *
++ * When set, every guest code fetch made by the translator is served by
++ * this callback instead of guest memory. Used by libtcg to translate from
++ * a caller-supplied buffer; NULL in the emulators.
++ */
++extern bool (*libtcg_code_read)(void *dest, vaddr pc, size_t len);
++
+ #endif /* EXEC__TRANSLATOR_H */
+diff -r a/meson.build b/meson.build
+--- a/meson.build	2026-10-03 15:54:54.460485615 +0200
++++ b/meson.build	2026-10-03 15:55:10.994071705 +0200
+@@ -4489,6 +4489,24 @@
+     }]
+ 
+   endforeach
++
++  # libtcg: the same objects as qemu-<target>, linked as a shared library
++  # exposing only the libtcg_* translation API (see libtcg/libtcg.h).
++  if target_type == 'user' and 'CONFIG_LINUX_USER' in config_target
++    libtcg_ver = meson.current_source_dir() / 'libtcg' / 'libtcg.ver'
++    shared_module('tcg-' + target_name,
++                  files('libtcg/libtcg.c'),
++                  c_args: c_args,
++                  include_directories: target_inc + include_directories('libtcg'),
++                  dependencies: arch_deps + [target_stubs],
++                  objects: lib.extract_all_objects(recursive: true),
++                  link_depends: files('libtcg/libtcg.ver'),
++                  link_args: link_args + ['-Wl,--version-script=' + libtcg_ver,
++                                          '-Wl,-z,defs'],
++                  name_prefix: 'lib',
++                  build_by_default: true,
++                  install: false)
++  endif
+ endforeach
+ 
+ # Other build targets

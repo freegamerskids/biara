@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+libtcg-sys = { path = "crates/libtcg-sys" }
+biara-tcg = { path = "crates/biara-tcg" }
+biara-loader = { path = "crates/biara-loader" }
+biara-cfg = { path = "crates/biara-cfg" }
+biara-abi = { path = "crates/biara-abi" }
+biara-lift = { path = "crates/biara-lift" }
+biara-diff = { path = "crates/biara-diff" }
+biara-engine = { path = "crates/biara-engine" }
+
+anyhow = "1.0.104"
+bindgen = "0.73.2"
+cc = "1.6.0"
+clap = { version = "4.6.7", features = ["derive"] }
+libloading = "0.9.0"
+object = "0.40.0"
+gimli = { version = "0.34.0", default-features = false, features = ["read", "std"] }
+thiserror = "2.0.21"
+parking_lot = "0.12.5"
+libc = "0.2.190"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.151"
+postcard = { version = "1", features = ["alloc", "use-std"] }
+blake3 = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+memmap2 = "0.9"
+# LLVM 23 support is on inkwell master only (0.10.0 stops at LLVM 22).
+inkwell = { git = "https://github.com/TheDan64/inkwell", rev = "5718b632ae689376f74ddfb4ff804a90eb7319f0", default-features = false, features = ["llvm23-1-force-static", "target-x86"] }

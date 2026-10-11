@@ -1,0 +1,20 @@
+[package]
+name = "biara-diff"
+description = "Binary diffing: match functions between two recovered programs"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+biara-cfg.workspace = true
+biara-loader.workspace = true
+biara-tcg.workspace = true
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+biara-cfg.workspace = true
+biara-lift.workspace = true
+biara-loader.workspace = true
+biara-tcg.workspace = true

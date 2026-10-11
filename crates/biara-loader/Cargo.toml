@@ -1,0 +1,13 @@
+[package]
+name = "biara-loader"
+description = "Executable loading: segments, symbols, imports, function starts"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+gimli.workspace = true
+object.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+thiserror.workspace = true

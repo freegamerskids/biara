@@ -1,0 +1,12 @@
+[package]
+name = "libtcg-sys"
+description = "Runtime-loaded bindings to libtcg-<arch>.so (libtcg/libtcg.h)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libloading.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true

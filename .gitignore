@@ -1,0 +1,5 @@
+/target
+/.deps
+biara_**.c
+biara_**.txt
+**.dll

@@ -1,0 +1,12 @@
+{
+  global:
+    libtcg_api_version;
+    libtcg_context_create;
+    libtcg_context_info;
+    libtcg_op_defs;
+    libtcg_env;
+    libtcg_translate;
+    libtcg_tb_free;
+  local:
+    *;
+};

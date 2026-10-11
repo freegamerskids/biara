@@ -1,0 +1,12 @@
+[package]
+name = "biara-abi"
+description = "Stack frame and calling-convention recovery over recovered functions"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+biara-cfg.workspace = true
+biara-tcg.workspace = true
+thiserror.workspace = true
+serde.workspace = true

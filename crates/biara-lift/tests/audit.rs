@@ -14,9 +14,8 @@ mod formats;
 use std::collections::BTreeSet;
 
 use biara_lift::{
-    Arg, CallSite, CallSites, Callee,
+    Arg, CallSite, CallSites, Callee, analysis_machine,
     audit::{Input, Issue, audit},
-    host_machine,
 };
 use biara_loader::Image;
 use biara_tcg::Libtcg;
@@ -24,7 +23,7 @@ use common::recover_program;
 use formats::Target;
 
 fn check(target: &Target) {
-    let machine = host_machine().unwrap();
+    let machine = analysis_machine().unwrap();
     for opt in [0, 2] {
         let at = format!("{} -O{opt}", target.name);
         let path = (target.build)(opt);

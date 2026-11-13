@@ -48,13 +48,18 @@ use inkwell::module::Module;
 use crate::decompile::CField;
 
 /// One observed field of a shared layout: `bytes` accessed at `off`, what
-/// it points to, and its display name.
+/// it points to, and its display name. `asserted` carries a user-declared
+/// C type when a struct binding bound this field (`""`/missing means
+/// inferred only): asserted vs inferred provenance for consumers.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LayoutField {
     pub off: i64,
     pub bytes: u32,
     pub pointee: Option<u32>,
     pub name: String,
+    /// User-asserted C type (`""` when inferred only).
+    #[serde(default)]
+    pub asserted: String,
 }
 
 /// One reusable inferred layout: fields at the offsets accessed, widest
@@ -165,8 +170,29 @@ pub fn analyze_layouts(
 unsafe extern "C" {
     fn biara_layouts_build(module: *mut c_void, cpu: *const CField, ncpu: usize) -> *mut c_void;
     fn biara_layouts_apply_debug(layouts: *mut c_void, module: *mut c_void) -> c_int;
+    fn biara_layouts_bind_structs(
+        layouts: *mut c_void,
+        classes: *const c_int,
+        structs: *const CStruct,
+        nbinds: usize,
+    ) -> c_int;
     fn biara_layouts_json(layouts: *const c_void, write: JsonWrite, ctx: *mut c_void) -> c_int;
     fn biara_layouts_free(layouts: *mut c_void);
+}
+
+#[repr(C)]
+struct CStructField {
+    off: i64,
+    bytes: u32,
+    name: *const c_char,
+    field_type: *const c_char,
+}
+
+#[repr(C)]
+struct CStruct {
+    name: *const c_char,
+    fields: *const CStructField,
+    nfields: usize,
 }
 
 type JsonWrite = unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> c_int;
@@ -191,6 +217,26 @@ unsafe extern "C" fn json_cb(ctx: *mut c_void, p: *const c_char, n: usize) -> c_
         return 1;
     }
     0
+}
+
+/// Canonical C spelling for a declared struct field: the asserted
+/// `type_name` when present, else the width-implied unsigned integer.
+/// Validation already width-checked the spelling; this only fills the
+/// default so the renderer never guesses signedness.
+fn canonical_field_type(field: &biara_proto::annotations::StructField) -> String {
+    let spelling = field.type_name.trim();
+    if !spelling.is_empty() {
+        return spelling.to_owned();
+    }
+    match field.bytes {
+        1 => "uint8_t",
+        2 => "uint16_t",
+        4 => "uint32_t",
+        8 => "uint64_t",
+        16 => "biara_u128",
+        _ => "uint8_t",
+    }
+    .to_owned()
 }
 
 /// RAII owner of one cached native layout analysis.
@@ -238,8 +284,6 @@ impl Handle {
         Ok(Handle { raw })
     }
 
-    /// Re-run DWARF display renames after debug metadata changed. Only
-    /// display names move; ids, sizes, offsets, and bindings are stable.
     pub(crate) fn apply_debug(&mut self, module: &Module<'_>) -> Result<(), crate::Error> {
         let failed =
             unsafe { biara_layouts_apply_debug(self.raw.as_ptr(), module.as_mut_ptr().cast()) };
@@ -249,6 +293,118 @@ impl Handle {
         Ok(())
     }
 
+    /// Apply user-declared struct bindings to referenced layout ids.
+    /// Each entry binds one layout id to its declared struct (names, typed
+    /// fields, padding, extra members); unreferenced or uncovered layouts
+    /// never change. Ids, offsets and bindings otherwise stay; `facts()`
+    /// re-export after binding carries asserted types and provenance.
+    pub(crate) fn bind_by_name(
+        &mut self,
+        binds: &[(String, biara_proto::annotations::StructAnnotation)],
+        referenced: &std::collections::BTreeSet<u32>,
+    ) -> Result<(), crate::Error> {
+        if binds.is_empty() {
+            return Ok(());
+        }
+        // Expand (struct, referenced ids) into native (class-key, struct)
+        // pairs; the native side resolves layout ids to classes through
+        // its export-id map and applies coverage per layout.
+        let mut native: Vec<(i32, String, biara_proto::annotations::StructAnnotation)> = Vec::new();
+        for (name, decl) in binds {
+            for id in referenced {
+                native.push((*id as i32, name.clone(), decl.clone()));
+            }
+        }
+        // `StructAnnotation` carries no ordering: sort/dedup by the
+        // rendered key (id, struct name, serialized declaration).
+        native.sort_by_key(|(id, name, decl)| {
+            (
+                *id,
+                name.clone(),
+                serde_json::to_string(decl).unwrap_or_default(),
+            )
+        });
+        native.dedup_by(|a, b| {
+            a.0 == b.0
+                && a.1 == b.1
+                && serde_json::to_string(&a.2).unwrap_or_default()
+                    == serde_json::to_string(&b.2).unwrap_or_default()
+        });
+        self.bind_structs(&native)
+    }
+
+    fn bind_structs(
+        &mut self,
+        binds: &[(i32, String, biara_proto::annotations::StructAnnotation)],
+    ) -> Result<(), crate::Error> {
+        if binds.is_empty() {
+            return Ok(());
+        }
+        let mut names: Vec<CString> = Vec::new();
+        let mut field_names: Vec<Vec<CString>> = Vec::new();
+        let mut field_types: Vec<Vec<CString>> = Vec::new();
+        let mut classes: Vec<c_int> = Vec::new();
+        for (class, name, layout) in binds {
+            classes.push(*class);
+            names.push(
+                CString::new(name.as_str())
+                    .map_err(|_| crate::Error::Llvm("struct name contains NUL".into()))?,
+            );
+            let mut cfields = Vec::with_capacity(layout.fields.len());
+            let mut ctypes = Vec::with_capacity(layout.fields.len());
+            for field in &layout.fields {
+                cfields
+                    .push(CString::new(field.name.as_str()).map_err(|_| {
+                        crate::Error::Llvm("struct field name contains NUL".into())
+                    })?);
+                ctypes
+                    .push(CString::new(canonical_field_type(field)).map_err(|_| {
+                        crate::Error::Llvm("struct field type contains NUL".into())
+                    })?);
+            }
+            field_names.push(cfields);
+            field_types.push(ctypes);
+        }
+        let mut storage: Vec<Vec<CStructField>> = Vec::new();
+        for ((layout, cfields), ctypes) in binds
+            .iter()
+            .map(|(_, _, layout)| layout)
+            .zip(&field_names)
+            .zip(&field_types)
+        {
+            let mut entries = Vec::with_capacity(layout.fields.len());
+            for ((field, cfield), ctype) in layout.fields.iter().zip(cfields).zip(ctypes) {
+                entries.push(CStructField {
+                    off: field.offset,
+                    bytes: field.bytes,
+                    name: cfield.as_ptr(),
+                    field_type: ctype.as_ptr(),
+                });
+            }
+            storage.push(entries);
+        }
+        let keys: Vec<CStruct> = names
+            .iter()
+            .zip(&storage)
+            .map(|(name, fields)| CStruct {
+                name: name.as_ptr(),
+                fields: fields.as_ptr(),
+                nfields: fields.len(),
+            })
+            .collect();
+        let bound = unsafe {
+            biara_layouts_bind_structs(
+                self.raw.as_ptr(),
+                classes.as_ptr(),
+                keys.as_ptr(),
+                keys.len(),
+            )
+        };
+        if bound < 0 {
+            return Err(crate::Error::Llvm("layout struct bind failed".into()));
+        }
+        Ok(())
+    }
     /// Export owned facts: layouts, frames, bindings, conflicts, status,
     /// and limits. Small by construction (no per-instruction data).
     pub(crate) fn facts(&self) -> Result<LayoutFacts, crate::Error> {

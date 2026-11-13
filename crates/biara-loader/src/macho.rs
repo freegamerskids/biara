@@ -165,9 +165,13 @@ pub(crate) fn parts(
         }
         let segs: Vec<(u64, &[u8])> = file
             .segments()
-            .map(|s| {
+            .filter_map(|s| {
                 let (off, len) = s.file_range();
-                (s.address(), &data[off as usize..][..len as usize])
+                // Hostile file ranges must not panic the loader: skip ranges
+                // that are not file-backed instead of slicing blindly.
+                let off: usize = off.try_into().ok()?;
+                let len: usize = len.try_into().ok()?;
+                Some((s.address(), data.get(off..)?.get(..len)?))
             })
             .collect();
         for seg in fixups.segments(endian).map_err(crate::Error::Parse)? {
@@ -226,8 +230,8 @@ pub(crate) fn parts(
             let next = starts
                 .get(i + 1)
                 .copied()
-                .unwrap_or_else(|| ends.iter().copied().find(|&e| e > s).unwrap_or(s + 4));
-            s..next.max(s + 4)
+                .unwrap_or_else(|| ends.iter().copied().find(|&e| e > s).unwrap_or(s.saturating_add(4)));
+            s..next.max(s.saturating_add(4))
         })
         .collect();
     // `__DATA_CONST` is written by fixups, then made read-only.
@@ -235,7 +239,7 @@ pub(crate) fn parts(
         .sections()
         .filter_map(|s| {
             (s.segment_name() == Ok(Some("__DATA")) && s.name() == Ok("__const"))
-                .then(|| s.address()..s.address() + s.size())
+                .then(|| s.address()..s.address().saturating_add(s.size()))
         })
         .collect();
     let scan: Vec<Range<u64>> = file
@@ -244,7 +248,7 @@ pub(crate) fn parts(
             !matches!(s.kind(), object::SectionKind::Text)
                 && s.segment_name().is_ok_and(|n| n != Some("__LINKEDIT"))
         })
-        .map(|s| s.address()..s.address() + s.size())
+        .map(|s| s.address()..s.address().saturating_add(s.size()))
         .collect();
     let mut listed: Vec<u64> = values.into_iter().collect();
     listed.extend(indirect.keys().filter_map(|s| mem.word_at(*s)));
@@ -273,6 +277,7 @@ pub(crate) fn parts(
 fn file_offset_addr(file: &MachOFile64<object::Endianness>, off: u64) -> Option<u64> {
     file.segments().find_map(|s| {
         let (start, len) = s.file_range();
-        (start <= off && off < start + len).then(|| s.address().wrapping_add(off - start))
+        (start <= off && off < start.saturating_add(len))
+            .then(|| s.address().saturating_add(off - start))
     })
 }

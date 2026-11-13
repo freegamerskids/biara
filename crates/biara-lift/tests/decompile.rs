@@ -17,7 +17,7 @@ use std::{
     process::Command,
 };
 
-use biara_lift::{ResolveOptions, host_machine, prepare_c, recover_resolving};
+use biara_lift::{ResolveOptions, analysis_machine, prepare_c, recover_resolving};
 use biara_tcg::Libtcg;
 use common::{
     corpus::{self, FUNCTIONS, inputs},
@@ -44,7 +44,7 @@ fn build(arch: &str, target: &str, opt: u8, base: u64) -> Built {
     corpus::map(&image, host);
     let shared = Libtcg::load(&Libtcg::find(arch).expect("libtcg"), None).unwrap();
     let mut lib = shared.lock();
-    let machine = host_machine().unwrap();
+    let machine = analysis_machine().unwrap();
     let present: Vec<(&str, u64)> = FUNCTIONS
         .iter()
         .filter_map(|&(n, _)| image.symbol(n).map(|s| (n, s.addr)))

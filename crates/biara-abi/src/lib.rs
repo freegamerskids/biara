@@ -131,6 +131,100 @@ pub struct FunctionAbi {
     /// bits or a different width on another): consumers must keep the raw
     /// word signature there rather than a typed one.
     pub fp_conflicts: BTreeSet<u32>,
+    /// Declared argument lanes, recorded separately from declared result
+    /// lanes: argument TempIds name integer registers the declaration
+    /// assigns as pointers; result TempIds name the integer result
+    /// register(s) the declaration assigns instead. Split because AAPCS64
+    /// uses `x0` for both argument 0 and the scalar result: one shared
+    /// per-physical-register set would alias a pointer argument into a
+    /// pointer result (and a narrow argument into a narrow result).
+    /// Set only by annotation application, never by recovery; empty by
+    /// default so wire data without it deserializes unchanged. The lifter
+    /// lowers pointer lanes to LLVM pointer types instead of raw words;
+    /// integer/pointer transport stays bit-exact (inttoptr/ptrtoint).
+    #[serde(default)]
+    pub explicit_ptr_args: BTreeSet<TempId>,
+    /// Declared result lanes assigned as pointers (see above): never
+    /// aliases [`FunctionAbi::explicit_ptr_args`].
+    #[serde(default)]
+    pub explicit_ptr_rets: BTreeSet<TempId>,
+    /// Declared narrow argument lanes by TempId to their width (8 or 16):
+    /// the lifter lowers these to i8/i16 slots with bit-exact coerce at
+    /// the register boundary. 32/64-bit lanes need no entry.
+    #[serde(default)]
+    pub explicit_narrow_args: BTreeMap<TempId, u32>,
+    /// Declared narrow result lanes by TempId (see above): never aliases
+    /// [`FunctionAbi::explicit_narrow_args`].
+    #[serde(default)]
+    pub explicit_narrow_rets: BTreeMap<TempId, u32>,
+    /// Argument lanes whose declared C type is signed (per TempId).
+    /// Transport is sign-agnostic (LLVM integers carry bits; boundary
+    /// coercions use zero-extension), so this only selects the rendered
+    /// spelling (`int16_t` vs `uint16_t`). Absent means unsigned.
+    /// Never aliases the result set below. Set only by annotation
+    /// application.
+    #[serde(default)]
+    pub explicit_signed_args: BTreeSet<TempId>,
+    /// Result lanes whose declared C type is signed (see above).
+    #[serde(default)]
+    pub explicit_signed_rets: BTreeSet<TempId>,
+    /// Declared boolean argument lanes (per TempId): `_Bool` transport is
+    /// `i1` (zero-extended at the register boundary); the declared
+    /// spelling stays `_Bool`. Never aliases the result set below.
+    #[serde(default)]
+    pub explicit_bool_args: BTreeSet<TempId>,
+    /// Declared boolean result lanes (see above).
+    #[serde(default)]
+    pub explicit_bool_rets: BTreeSet<TempId>,
+    /// Declared narrow/stack widths for spilled scalar stack slots, by
+    /// entry-sp-relative byte offset: `(offset, declared width bits)`.
+    /// Only set when the declaration assigns a scalar type narrower than
+    /// the 64-bit stack slot to a stack parameter; the ABI former coerces
+    /// bit-exactly at the slot boundary. Absent offsets keep `i64`.
+    #[serde(default)]
+    pub explicit_stack_narrow: BTreeMap<i64, u32>,
+    /// Declared signedness for spilled scalar stack slots, by offset.
+    #[serde(default)]
+    pub explicit_stack_signed: BTreeSet<i64>,
+    /// Declared boolean stack slots, by offset (`i1` transport).
+    #[serde(default)]
+    pub explicit_stack_bool: BTreeSet<i64>,
+    /// Per-function struct bindings for explicit `struct name *`
+    /// argument lanes: `(lane, struct name)` pairs naming which declared
+    /// layout each pointer lane carries. Never aliases the result map
+    /// below. The renderer uses the named declaration for that lane's
+    /// pointees; unrelated layouts with matching shapes are never renamed
+    /// or merged by this.
+    #[serde(default)]
+    pub explicit_struct_args: BTreeMap<TempId, String>,
+    /// Per-function struct bindings for explicit `struct name *` result
+    /// lanes (see above).
+    #[serde(default)]
+    pub explicit_struct_rets: BTreeMap<TempId, String>,
+    /// Ordered declared formal widening: every declared parameter in
+    /// declaration order that the convention places in a register or
+    /// stack slot beyond recovered inference, as
+    /// `(lane TempId or stack offset marker, kind, declared spelling)`.
+    /// Encoded as three parallel vectors so the ABI map stays serde-plain:
+    /// `explicit_order_lanes` holds register TempIds for register formals
+    /// and `u32::MAX` for stack formals; `explicit_order_stack` holds the
+    /// stack offset for stack formals and `0` otherwise;
+    /// `explicit_order_spellings` holds the canonical C spelling per
+    /// formal (`_Bool`, `int16_t`, `struct Header *`, ...). The lifter
+    /// uses this to emit interleaved LLVM formals (not int-bank then
+    /// FP-bank) and to attach `biara.c_type` attrs in order.
+    #[serde(default)]
+    pub explicit_order_lanes: Vec<u32>,
+    #[serde(default)]
+    pub explicit_order_stack: Vec<i64>,
+    #[serde(default)]
+    pub explicit_order_spellings: Vec<String>,
+    /// Canonical declared C return spelling (`void`, `int16_t`, `double`,
+    /// `struct Header *`, ...). Empty (default) means undeclared: the
+    /// renderer keeps the recovered spelling. Set only by annotation
+    /// application; consumed as the `biara.c_return` function attribute.
+    #[serde(default)]
+    pub explicit_return_spelling: String,
     /// Aggregate return shape established from evidence: `None` for a plain
     /// scalar, `Some(Pair)` when two result registers carry one value,
     /// `Some(Memory)` when hidden-`sret` evidence proves the caller passes
@@ -159,7 +253,23 @@ impl FunctionAbi {
             && self.fp_returns == other.fp_returns
             && self.fp_ret_types == other.fp_ret_types
             && self.fp_conflicts == other.fp_conflicts
-            && self.ret_class == other.ret_class
+            && self.explicit_ptr_args == other.explicit_ptr_args
+            && self.explicit_ptr_rets == other.explicit_ptr_rets
+            && self.explicit_narrow_args == other.explicit_narrow_args
+            && self.explicit_narrow_rets == other.explicit_narrow_rets
+            && self.explicit_signed_args == other.explicit_signed_args
+            && self.explicit_signed_rets == other.explicit_signed_rets
+            && self.explicit_bool_args == other.explicit_bool_args
+            && self.explicit_bool_rets == other.explicit_bool_rets
+            && self.explicit_stack_narrow == other.explicit_stack_narrow
+            && self.explicit_stack_signed == other.explicit_stack_signed
+            && self.explicit_stack_bool == other.explicit_stack_bool
+            && self.explicit_struct_args == other.explicit_struct_args
+            && self.explicit_struct_rets == other.explicit_struct_rets
+            && self.explicit_order_lanes == other.explicit_order_lanes
+            && self.explicit_order_stack == other.explicit_order_stack
+            && self.explicit_order_spellings == other.explicit_order_spellings
+            && self.explicit_return_spelling == other.explicit_return_spelling
     }
 }
 
@@ -883,6 +993,23 @@ impl<'a> Ctx<'a> {
                 balanced,
             },
             args,
+            explicit_ptr_args: BTreeSet::new(),
+            explicit_ptr_rets: BTreeSet::new(),
+            explicit_narrow_args: BTreeMap::new(),
+            explicit_narrow_rets: BTreeMap::new(),
+            explicit_signed_args: BTreeSet::new(),
+            explicit_signed_rets: BTreeSet::new(),
+            explicit_bool_args: BTreeSet::new(),
+            explicit_bool_rets: BTreeSet::new(),
+            explicit_stack_narrow: BTreeMap::new(),
+            explicit_stack_signed: BTreeSet::new(),
+            explicit_stack_bool: BTreeSet::new(),
+            explicit_struct_args: BTreeMap::new(),
+            explicit_struct_rets: BTreeMap::new(),
+            explicit_order_lanes: Vec::new(),
+            explicit_order_stack: Vec::new(),
+            explicit_order_spellings: Vec::new(),
+            explicit_return_spelling: String::new(),
             stack_args: facts.stack_args,
             // Caller demands are merged after the round. Root defaults must
             // contribute dependencies before argument facts are finalized.

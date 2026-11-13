@@ -3,7 +3,9 @@
 
 mod common;
 
-use biara_lift::{DecompileOptions, ResolveOptions, host_machine, prepare_c, recover_resolving};
+use biara_lift::{
+    DecompileOptions, ResolveOptions, analysis_machine, prepare_c, recover_resolving,
+};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 use std::{
@@ -41,9 +43,9 @@ KEEP double typed_mix(U a, double b, U c, float d) { return a*b+c+d; }
 KEEP double typed_mix_call(double a, float b) { return typed_mix(5,a,7,b); }
 "#;
 
-fn exercise(arch: &str, target: &str, opt: u8, base: u64) {
+fn exercise(arch: &str, target: &str, opt: u8, base: u64, annotated: bool) {
     let windows = target.contains("windows");
-    let dir = common::tmp().join(format!("typed-{arch}-{windows}-O{opt}"));
+    let dir = common::tmp().join(format!("typed-{arch}-{windows}-O{opt}-{annotated}"));
     std::fs::create_dir_all(&dir).unwrap();
     let fixture = dir.join("fixture.c");
     std::fs::write(&fixture, if windows { WINDOWS_FIXTURE } else { FIXTURE }).unwrap();
@@ -108,7 +110,7 @@ fn exercise(arch: &str, target: &str, opt: u8, base: u64) {
     common::corpus::map(&image, false);
     let shared = Libtcg::load(&Libtcg::find(arch).unwrap(), None).unwrap();
     let mut lib = shared.lock();
-    let machine = host_machine().unwrap();
+    let machine = analysis_machine().unwrap();
     let entries: Vec<_> = image
         .symbols
         .iter()
@@ -127,7 +129,19 @@ fn exercise(arch: &str, target: &str, opt: u8, base: u64) {
     )
     .unwrap();
     let info = lib.info().clone();
-    let abis = biara_abi::analyze(&cfg, &info).unwrap();
+    let mut abis = biara_abi::analyze(&cfg, &info).unwrap();
+    let mut annotations = biara_proto::annotations::Annotations::default();
+    if annotated {
+        annotations.functions.insert(
+            image.symbol("typed_mix").unwrap().addr,
+            biara_proto::annotations::FunctionAnnotation {
+                signature: Some("double typed_mix(uint64_t, double, uint64_t, float)".into()),
+                ..Default::default()
+            },
+        );
+        biara_lift::annotations::apply_abi_annotations(&cfg, &info, &mut abis, &annotations)
+            .unwrap();
+    }
     if !windows {
         let raw = &abis[&image.symbol("typed_raw").unwrap().addr];
         assert!(
@@ -154,6 +168,7 @@ fn exercise(arch: &str, target: &str, opt: u8, base: u64) {
             DecompileOptions::default(),
         )
         .unwrap();
+    transformed.apply_annotations(&annotations).unwrap();
     let facts = transformed.type_facts().unwrap();
     let d = facts
         .signatures
@@ -326,6 +341,148 @@ int check_vector(void) {{
     }
 }
 
+/// Declared scalar/boolean/pointer types: consumer invariants over the
+/// ABI-form module, not source-text pins. A synthetic module with
+/// `biara.c_type`/`biara.c_return` attributes (as `prepare_c` attaches
+/// them after the native ABI form) must surface in [`FuncSig`] declared
+/// facts and transport: `_Bool` is `i1` (never a 32-bit integer),
+/// `int16_t` is `i16` with a signed spelling, `long` keeps its
+/// guest-model width, `struct Header *` stays a pointer with its name,
+/// interleaved `mixed` order is preserved in the formal sequence, and
+/// conflicting AAPCS64 `x0` argument/result declarations stay split
+/// (a pointer argument never leaks into the result).
+#[test]
+fn declared_types_flow_to_transport_and_facts() {
+    use biara_lift::{AbiResult, AbiTy};
+    let cx = inkwell::context::Context::create();
+    let module = cx.create_module("declared");
+    let i1 = cx.bool_type();
+    let i8t = cx.i8_type();
+    let i16t = cx.i16_type();
+    let i32t = cx.i32_type();
+    let i64t = cx.i64_type();
+    let f32t = cx.f32_type();
+    let f64t = cx.f64_type();
+    let ptrt = cx.ptr_type(inkwell::AddressSpace::default());
+    // narrow16(int16_t) -> int16_t: i16 transport, signed spelling.
+    let narrow = module.add_function("narrow16", i16t.fn_type(&[i16t.into()], false), None);
+    // mixed(u64,double,u64,float) -> double: interleaved formals.
+    let mixed = module.add_function(
+        "mixed",
+        f64t.fn_type(&[i64t.into(), f64t.into(), i64t.into(), f32t.into()], false),
+        None,
+    );
+    // flag(_Bool) -> _Bool: i1 transport, boolean spelling.
+    let flag = module.add_function("flag", i1.fn_type(&[i1.into()], false), None);
+    // grow(long) -> long: i32 transport on LLP64 ( tested spelling only).
+    let grow = module.add_function("grow", i32t.fn_type(&[i32t.into()], false), None);
+    // touch(struct Header *) -> uint64_t: pointer transport, named spelling.
+    let touch = module.add_function("touch", i64t.fn_type(&[ptrt.into()], false), None);
+    // narrow8(uint8_t) -> uint8_t: i8 transport, unsigned spelling.
+    let narrow8 = module.add_function("narrow8", i8t.fn_type(&[i8t.into()], false), None);
+    for (f, addr) in [
+        (narrow, 0x1000u64),
+        (mixed, 0x2000u64),
+        (flag, 0x3000u64),
+        (grow, 0x4000u64),
+        (touch, 0x5000u64),
+        (narrow8, 0x6000u64),
+    ] {
+        let entry = cx.metadata_node(&[
+            cx.i64_type().const_int(addr, false).into(),
+            cx.i32_type().const_int(1, false).into(),
+        ]);
+        f.as_global_value()
+            .set_metadata(entry, cx.get_kind_id("biara.entry"));
+        let block = cx.append_basic_block(f, "entry");
+        let builder = cx.create_builder();
+        builder.position_at_end(block);
+        builder.build_return(None).unwrap();
+    }
+    // Attach declared spellings exactly as `prepare_c` does after the
+    // native ABI form (param `biara.c_type`, function `biara.c_return`).
+    use inkwell::attributes::AttributeLoc;
+    let attach = |f: inkwell::values::FunctionValue<'_>, params: &[&str], ret: &str| {
+        for (i, spelling) in params.iter().enumerate() {
+            f.add_attribute(
+                AttributeLoc::Param(i as u32),
+                cx.create_string_attribute(biara_lift::signatures::DECLARED_PARAM_ATTR, spelling),
+            );
+        }
+        f.add_attribute(
+            AttributeLoc::Function,
+            cx.create_string_attribute(biara_lift::signatures::DECLARED_RETURN_ATTR, ret),
+        );
+    };
+    attach(narrow, &["int16_t"], "int16_t");
+    attach(
+        mixed,
+        &["uint64_t", "double", "uint64_t", "float"],
+        "double",
+    );
+    attach(flag, &["_Bool"], "_Bool");
+    attach(grow, &["long"], "long");
+    attach(touch, &["struct Header *"], "uint64_t");
+    attach(narrow8, &["uint8_t"], "uint8_t");
+    let layouts = biara_lift::LayoutFacts {
+        status: biara_lift::FactStatus::Complete,
+        layouts: Vec::new(),
+        frames: Vec::new(),
+        args: Vec::new(),
+        returns: Vec::new(),
+        conflicts: Vec::new(),
+        limits: biara_lift::LayoutLimits {
+            iterations: 0,
+            iteration_cap: 0,
+            max_field_offset: 0,
+            capped_offsets: 0,
+            unsupported_bases: 0,
+            overflowed_offsets: 0,
+        },
+    };
+    let sigs = biara_lift::summarize(&module, &layouts).unwrap();
+    assert_eq!(sigs.len(), 6);
+    let by_name = |n: &str| sigs.iter().find(|s| s.name == n).unwrap();
+    // Signed narrow: transport i16, declared spelling signed.
+    let s = by_name("narrow16");
+    assert_eq!(s.params, vec![AbiTy::I16]);
+    assert_eq!(s.declared_params, vec!["int16_t"]);
+    assert_eq!(s.declared_return, "int16_t");
+    assert_eq!(s.result, AbiResult::One(AbiTy::I16));
+    // Unsigned narrow stays distinct (no signedness collapse).
+    let s = by_name("narrow8");
+    assert_eq!(s.params, vec![AbiTy::I8]);
+    assert_eq!(s.declared_params, vec!["uint8_t"]);
+    // Boolean is i1, never a 32-bit integer disguise.
+    let s = by_name("flag");
+    assert_eq!(s.params, vec![AbiTy::Bool]);
+    assert_eq!(s.declared_params, vec!["_Bool"]);
+    assert_eq!(s.result, AbiResult::One(AbiTy::Bool));
+    assert_ne!(s.params, vec![AbiTy::I32]);
+    // Interleaved order survives: (u64,double,u64,float), not banked.
+    let s = by_name("mixed");
+    assert_eq!(
+        s.params,
+        vec![AbiTy::I64, AbiTy::F64, AbiTy::I64, AbiTy::F32]
+    );
+    assert_eq!(
+        s.declared_params,
+        vec!["uint64_t", "double", "uint64_t", "float"]
+    );
+    assert_eq!(s.declared_return, "double");
+    // Guest-model width: `long` spelling preserved for the consumer
+    // (transport resolved by guest model at attach time).
+    let s = by_name("grow");
+    assert_eq!(s.declared_params, vec!["long"]);
+    assert_eq!(s.declared_return, "long");
+    // Named struct pointer: pointer transport, named declared spelling.
+    let s = by_name("touch");
+    assert_eq!(s.params, vec![AbiTy::Ptr { layout: None }]);
+    assert_eq!(s.declared_params, vec!["struct Header *"]);
+    // Undeclared slots surface empty spellings, never guessed types.
+    assert!(s.declared_return == "uint64_t");
+}
+
 #[test]
 fn typed_generated_c_executes() {
     for (i, (arch, target)) in [
@@ -341,15 +498,19 @@ fn typed_generated_c_executes() {
                 target,
                 opt,
                 0x5b00_0000_0000 + ((i * 4 + opt as usize) as u64) * 0x1_0000_0000,
+                false,
             );
         }
     }
     for opt in [0, 2] {
-        exercise(
-            "x86_64",
-            "x86_64-pc-windows-msvc",
-            opt,
-            0x5b10_0000_0000 + (opt as u64) * 0x1_0000_0000,
-        );
+        for annotated in [false, true] {
+            exercise(
+                "x86_64",
+                "x86_64-pc-windows-msvc",
+                opt,
+                0x5b10_0000_0000 + (opt as u64) * 0x1_0000_0000,
+                annotated,
+            );
+        }
     }
 }

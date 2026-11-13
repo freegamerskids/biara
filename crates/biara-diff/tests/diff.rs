@@ -10,7 +10,7 @@ use std::{
     process::Command,
 };
 
-use biara_diff::{Match, Program, diff};
+use biara_diff::{Match, Program, diff, report};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 
@@ -106,7 +106,7 @@ fn recover(arch: &str, path: &std::path::Path) -> (Image, biara_cfg::Cfg) {
     let image = Image::load(path).unwrap();
     let lib = Libtcg::load(&Libtcg::find(arch).expect("libtcg"), None).unwrap();
     let mut lib = lib.lock();
-    let machine = biara_lift::host_machine().unwrap();
+    let machine = biara_lift::analysis_machine().unwrap();
     let opts = biara_lift::ResolveOptions {
         cfg: biara_cfg::Options {
             os: image.os,
@@ -720,4 +720,194 @@ fn add_overwriting_adrp_register_invalidates_page_provenance() {
             Match::Changed { .. }
         ));
     }
+}
+
+/// `report` exposes every match kind, confidence and per-function block maps
+/// with correct guest addresses: a one-block change maps to exactly one
+/// changed positional pair, an identical function rebased to new addresses
+/// maps same-by-same, and ambiguity surfaces as uncertainty with issues.
+#[test]
+fn report_block_maps_confidence_and_addresses() {
+    use biara_proto::diff::{BlockStatus, FunctionKind};
+    let arch = "x86_64";
+    let source = |answer: i32, predicate: &str| {
+        format!(
+            r#"
+        __attribute__((noinline)) int changed(int x) {{ return x {predicate} 7; }}
+        __attribute__((noinline)) int steady(void) {{ __asm__ volatile("" ::: "memory"); return 41; }}
+        void _start(void) {{
+            int result = changed({answer}) + steady();
+            for (;;) __asm__ volatile("" : : "r"(result) : "memory");
+        }}
+    "#
+        )
+    };
+    let (image1, cfg1) = recover(
+        arch,
+        &build_source(arch, "report-old", &source(1, "<"), 0x400000),
+    );
+    // Same code, rebased image: pairing by name must stay `Same` at both
+    // function and block granularity with the new guest addresses.
+    let (image2, cfg2) = recover(
+        arch,
+        &build_source(arch, "report-rebased", &source(1, "<"), 0x700000),
+    );
+    let old = Program::new(&cfg1, &image1);
+    let rebased = Program::new(&cfg2, &image2);
+    let matches = diff(&old, &rebased);
+    assert!(
+        matches.iter().all(|m| matches!(m, Match::Same { .. })),
+        "{matches:?}"
+    );
+    let report = report(&old, &rebased, &matches);
+    assert_eq!(report.version, biara_proto::SCHEMA_VERSION);
+    let steady_old = cfg1
+        .functions
+        .keys()
+        .find(|&&e| old.name_of(e).as_deref() == Some("steady"))
+        .copied()
+        .unwrap();
+    let steady_new = cfg2
+        .functions
+        .keys()
+        .find(|&&e| rebased.name_of(e).as_deref() == Some("steady"))
+        .copied()
+        .unwrap();
+    let steady = report
+        .functions
+        .iter()
+        .find(|f| f.old_function == Some(steady_old))
+        .unwrap();
+    assert_eq!(steady.kind, FunctionKind::Same);
+    assert_eq!(steady.confidence, 1.0);
+    assert!(!steady.uncertain);
+    assert!(steady.reasons.is_empty());
+    assert_eq!(steady.new_function, Some(steady_new));
+    assert!(!steady.blocks.is_empty());
+    assert!(steady.blocks.iter().all(|b| b.status == BlockStatus::Same));
+    for (i, b) in steady.blocks.iter().enumerate() {
+        assert_eq!((b.old_index, b.new_index), (Some(i), Some(i)));
+        let old_addr = b.old_block.expect("paired block carries old address");
+        let new_addr = b.new_block.expect("paired block carries new address");
+        assert!(
+            cfg1.functions[&steady_old].blocks.contains(&old_addr),
+            "old block {i} must be a guest block of steady"
+        );
+        assert!(
+            cfg2.functions[&steady_new].blocks.contains(&new_addr),
+            "new block {i} must be a guest block of steady"
+        );
+    }
+    // Real round trip: the report is portable JSON, not a debug dump.
+    let json = serde_json::to_string(&report).unwrap();
+    let parsed: biara_proto::diff::DiffReport = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, report);
+    // One changed function: exactly one block pair must be `Changed`, the
+    // rest `Same`, and the changed block must name the real guest addresses.
+    let (image3, cfg3) = recover(
+        arch,
+        &build_source(arch, "report-new", &source(2, ">"), 0x400000),
+    );
+    let new = Program::new(&cfg3, &image3);
+    let matches = diff(&old, &new);
+    let changed_entry = cfg1
+        .functions
+        .keys()
+        .find(|&&e| old.name_of(e).as_deref() == Some("changed"))
+        .copied()
+        .unwrap();
+    assert!(matches!(
+        pair_named(&matches, &old, &new, "changed"),
+        Match::Changed { .. }
+    ));
+    let changed_report = biara_diff::report(&old, &new, &matches);
+    let changed = changed_report
+        .functions
+        .iter()
+        .find(|f| f.old_function == Some(changed_entry))
+        .unwrap();
+    assert_eq!(changed.kind, FunctionKind::Changed);
+    assert_eq!(changed.confidence, 1.0);
+    assert!(!changed.uncertain);
+    assert!(!changed.reasons.is_empty());
+    let changed_blocks: Vec<_> = changed
+        .blocks
+        .iter()
+        .filter(|b| b.status == BlockStatus::Changed)
+        .collect();
+    assert_eq!(changed_blocks.len(), 1, "{changed:?}");
+    let only = changed_blocks[0];
+    assert!(only.old_block.is_some() && only.new_block.is_some());
+    assert_eq!(
+        changed.blocks.len(),
+        cfg1.functions[&changed_entry].blocks.len()
+    );
+    assert!(
+        changed
+            .blocks
+            .iter()
+            .filter(|b| b.old_block == only.old_block)
+            .count()
+            == 1
+    );
+    // Ambiguity is preserved, not dropped: duplicate unnamed shapes report
+    // `Uncertain` with confidence below 1.0 and every issue from both sides.
+    ambiguous_duplicate_case(arch);
+}
+
+fn ambiguous_duplicate_case(arch: &str) {
+    use biara_proto::diff::{FunctionKind, Side};
+    let body = r#"
+        __attribute__((noinline)) int twin_a(void) { __asm__ volatile("" ::: "memory"); return 7; }
+        __attribute__((noinline)) int twin_b(void) { __asm__ volatile("" ::: "memory"); return 7; }
+        void _start(void) {
+            int result = twin_a() + twin_b();
+            for (;;) __asm__ volatile("" : : "r"(result) : "memory");
+        }
+    "#;
+    let (mut image1, cfg1) = recover(arch, &build_source(arch, "report-amb-old", body, 0x400000));
+    let (mut image2, cfg2) = recover(arch, &build_source(arch, "report-amb-new", body, 0x400000));
+    image1.symbols.retain(|s| s.name == "_start");
+    image2.symbols.retain(|s| s.name == "_start");
+    let old = Program::new(&cfg1, &image1);
+    let new = Program::new(&cfg2, &image2);
+    assert!(
+        old.comparison_issues()
+            .iter()
+            .any(|i| matches!(i, biara_diff::ComparisonIssue::Ambiguous { .. }))
+    );
+    let matches = diff(&old, &new);
+    assert!(
+        matches.iter().any(|m| matches!(m, Match::Uncertain { .. })),
+        "{matches:?}"
+    );
+    let amb_report = biara_diff::report(&old, &new, &matches);
+    assert!(amb_report.issues.iter().any(|i| matches!(
+        i,
+        biara_proto::diff::DiffIssue::Ambiguous {
+            side: Side::Old,
+            ..
+        }
+    )));
+    assert!(amb_report.issues.iter().any(|i| matches!(
+        i,
+        biara_proto::diff::DiffIssue::Ambiguous {
+            side: Side::New,
+            ..
+        }
+    )));
+    let uncertain: Vec<_> = amb_report
+        .functions
+        .iter()
+        .filter(|f| f.kind == FunctionKind::Uncertain)
+        .collect();
+    assert!(!uncertain.is_empty());
+    for f in uncertain {
+        assert!(f.uncertain);
+        assert!(f.confidence < 1.0);
+        assert!(!f.reasons.is_empty());
+        assert!(!f.blocks.is_empty());
+        assert!(f.old_function.is_some() && f.new_function.is_some());
+    }
+    assert_eq!(amb_report.functions.len(), matches.len());
 }

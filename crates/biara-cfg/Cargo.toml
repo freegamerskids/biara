@@ -4,6 +4,7 @@ description = "Control-flow recovery over libtcg translation blocks"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 biara-tcg.workspace = true

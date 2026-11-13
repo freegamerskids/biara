@@ -31,27 +31,12 @@
 mod layouts {
     use biara_lift::layouts::analyze_layouts;
     use inkwell::{
-        AddressSpace, OptimizationLevel,
-        context::Context,
-        targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine},
-        types::BasicType,
+        AddressSpace, context::Context, targets::TargetMachine, types::BasicType,
         values::BasicValueEnum,
     };
 
     fn machine() -> TargetMachine {
-        Target::initialize_native(&InitializationConfig::default()).unwrap();
-        let triple = TargetMachine::get_default_triple();
-        let target = Target::from_triple(&triple).unwrap();
-        target
-            .create_target_machine(
-                &triple,
-                "generic",
-                "",
-                OptimizationLevel::Default,
-                RelocMode::Default,
-                CodeModel::Default,
-            )
-            .unwrap()
+        biara_lift::analysis_machine().unwrap()
     }
 
     fn tag(cx: &Context, m: &inkwell::module::Module, f: inkwell::values::FunctionValue, e: u64) {

@@ -260,7 +260,7 @@ fn callee(c: &Callee) -> Value {
         Callee::Indirect { target } => json!({"kind":"indirect","target":arg(target)}),
     }
 }
-fn call(c: &CallSite) -> Value {
+pub(crate) fn call(c: &CallSite) -> Value {
     json!({"caller":c.caller,"address":c.pc,"callee":callee(&c.callee),"arguments":c.args.iter().map(arg).collect::<Vec<_>>()})
 }
 fn exit(kind: ExitKind) -> Value {
@@ -275,7 +275,7 @@ fn exit(kind: ExitKind) -> Value {
         ExitKind::Syscall { next } => json!({"kind":"syscall","continuation":next}),
     }
 }
-fn finding(f: &Finding) -> Value {
+pub(crate) fn finding(f: &Finding) -> Value {
     let issue = match &f.issue {
         Issue::Format {
             arg: index,
@@ -354,7 +354,16 @@ pub(crate) fn lift(
     info: &ContextInfo,
     machine: &TargetMachine,
     workers: usize,
+    annotations: &biara_proto::annotations::Annotations,
 ) -> Result<()> {
+    let name_of = |address| {
+        annotations
+            .functions
+            .get(&address)
+            .and_then(|f| f.name.as_deref())
+            .or_else(|| image.function_at(address).map(|f| f.name.as_str()))
+            .or_else(|| cfg.stub_import(address))
+    };
     match a.emit {
         Emit::Cfg => {
             #[derive(Serialize)]
@@ -372,7 +381,7 @@ pub(crate) fn lift(
                     "cfg",
                     CfgRows {
                         functions: Rows(|| {
-                            cfg.functions.values().map(|f|json!({"address":f.entry,"name":image.function_at(f.entry).map(|s|&s.name),"blocks":f.blocks,"calls":f.calls,"tail_calls":f.tail_calls,"may_return":f.returns}))
+                            cfg.functions.values().map(|f|json!({"address":f.entry,"name":name_of(f.entry),"blocks":f.blocks,"calls":f.calls,"tail_calls":f.tail_calls,"may_return":f.returns}))
                         }),
                         blocks: Rows(|| {
                             cfg.blocks.iter().map(|(&pc,b)|json!({"address":pc,"end":b.end(),"instructions":b.insns,"exits":b.exits.iter().map(|e|exit(e.kind)).collect::<Vec<_>>(),"jump_targets":cfg.jump_tables.get(&pc),"jump_targets_complete":!cfg.incomplete_jump_tables.contains(&pc),"call_targets":cfg.indirect_calls.get(&pc).map(|t|json!({"targets":t.targets,"complete":t.complete}))}))
@@ -382,7 +391,8 @@ pub(crate) fn lift(
             )
         }
         Emit::Abi => {
-            let abis = biara_abi::analyze_with_workers(cfg, info, workers)?;
+            let mut abis = biara_abi::analyze_with_workers(cfg, info, workers)?;
+            biara_lift::annotations::apply_abi_annotations(cfg, info, &mut abis, annotations)?;
             let names = |set: &BTreeSet<u32>| {
                 set.iter()
                     .map(|&g| info.globals[g as usize].name.as_deref())
@@ -398,7 +408,7 @@ pub(crate) fn lift(
                     "abi",
                     Rows(|| {
                         abis.iter().map(|(&address, abi)| json!({
-                    "address":address,"name":image.function_at(address).map(|s|&s.name),
+                    "address":address,"name":name_of(address),
                     "converged":abi.analysis.converged,"rounds":abi.analysis.rounds,
                     "arguments":names(&abi.args),"stack_arguments":abi.stack_args,
                     "returns":names(&abi.returns),"preserved":names(&abi.preserved),
@@ -417,7 +427,9 @@ pub(crate) fn lift(
             )
         }
         Emit::Calls | Emit::Audit => {
-            let mut sites = CallSites::new(machine, info, cfg)?;
+            let mut abis = biara_abi::analyze_with_workers(cfg, info, workers)?;
+            biara_lift::annotations::apply_abi_annotations(cfg, info, &mut abis, annotations)?;
+            let mut sites = CallSites::with_abis(machine, info, cfg, Some(abis))?;
             let findings = if matches!(a.emit, Emit::Audit) {
                 audit::audit(
                     &mut sites,
@@ -487,12 +499,10 @@ pub(crate) fn diff(
     a: &DiffArgs,
     old: DiffInput<'_>,
     new: DiffInput<'_>,
-    matches: &[&biara_diff::Match],
+    report: &biara_proto::diff::DiffReport,
 ) -> Result<()> {
-    // Use a borrowed tuple of named fields rather than serialize the recovered
-    // program or materialize a whole report tree.
     #[derive(Serialize)]
-    struct Report<'a, M: Serialize> {
+    struct Report<'a> {
         schema_version: u32,
         kind: &'static str,
         old_image: ImageInfo<'a>,
@@ -502,13 +512,14 @@ pub(crate) fn diff(
         old_comparison_issues: &'a [biara_diff::ComparisonIssue],
         new_comparison_issues: &'a [biara_diff::ComparisonIssue],
         comparison: &'static str,
-        matches: M,
+        matches: &'a [biara_proto::diff::FunctionDiff],
+        diff_issues: &'a [biara_proto::diff::DiffIssue],
     }
     emit(
         false,
         a.output.as_deref(),
         &Report {
-            schema_version: 1,
+            schema_version: biara_proto::SCHEMA_VERSION,
             kind: "diff",
             old_image: image_info(&a.old, old.image),
             new_image: image_info(&a.new, new.image),
@@ -517,21 +528,8 @@ pub(crate) fn diff(
             old_comparison_issues: old.program.comparison_issues(),
             new_comparison_issues: new.program.comparison_issues(),
             comparison: "normalized recovered TCG code; matching is not semantic equivalence",
-            matches: Rows(|| {
-                matches.iter().map(|m| match m {
-                    biara_diff::Match::Same { old, new } => {
-                        json!({"kind":"same","old":old,"new":new})
-                    }
-                    biara_diff::Match::Changed { old, new } => {
-                        json!({"kind":"changed","old":old,"new":new})
-                    }
-                    biara_diff::Match::Uncertain { old, new } => {
-                        json!({"kind":"uncertain","old":old,"new":new})
-                    }
-                    biara_diff::Match::Added { new } => json!({"kind":"added","new":new}),
-                    biara_diff::Match::Removed { old } => json!({"kind":"removed","old":old}),
-                })
-            }),
+            matches: &report.functions,
+            diff_issues: &report.issues,
         },
     )
 }

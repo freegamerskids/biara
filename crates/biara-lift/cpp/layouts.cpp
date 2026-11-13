@@ -1080,7 +1080,57 @@ std::string Types::ptrTy(int C) {
     return fieldTy(L.Fields[0]) + " *";
 }
 
+static std::string canonInt(unsigned Bytes, const std::string &Asserted) {
+    // Canonicalize a declared integer alias to its width/signedness-stable
+    // spelling: `long` is 8 bytes on the host but may be 4 on the guest
+    // (Win64 LLP64), so printing the alias literally would move offsets.
+    // Width-implied `intN_t`/`uintN_t` spell the same bytes everywhere;
+    // non-integer spellings (float/double/bool/pointers/structs/enums)
+    // pass through verbatim.
+    std::string Flat;
+    Flat.reserve(Asserted.size());
+    for (char C : Asserted) Flat += (char)tolower((unsigned char)C);
+    std::vector<std::string> words;
+    {
+      std::string W;
+      for (size_t I = 0; I <= Flat.size(); ++I) {
+        bool End = I == Flat.size() || Flat[I] == ' ' || Flat[I] == '\t';
+        if (!End) W += Flat[I];
+        else if (!W.empty()) {
+          if (W != "const" && W != "volatile" && W != "signed") words.push_back(W);
+          W.clear();
+        }
+      }
+    }
+    auto has = [&](const char *W) {
+      return std::find(words.begin(), words.end(), W) != words.end();
+    };
+    bool Unsigned = has("unsigned");
+    bool NonInt = has("bool") || has("_bool") || has("float") || has("double") ||
+                  Asserted.find('*') != std::string::npos ||
+                  Asserted.find("struct") != std::string::npos ||
+                  Asserted.find("union") != std::string::npos ||
+                  Asserted.find("enum") != std::string::npos;
+    if (NonInt) return Asserted;
+    bool IsInt = has("char") || has("short") || has("int") || has("long") ||
+                 has("int8_t") || has("int16_t") || has("int32_t") || has("int64_t") ||
+                 has("uint8_t") || has("uint16_t") || has("uint32_t") || has("uint64_t") ||
+                 has("u8") || has("u16") || has("u32") || has("u64") ||
+                 has("i8") || has("i16") || has("i32") || has("i64");
+    if (!IsInt) return Asserted;
+    std::string Prefix = Unsigned ? "uint" : "int";
+    switch (Bytes) {
+    case 1: return Prefix + "8_t";
+    case 2: return Prefix + "16_t";
+    case 4: return Prefix + "32_t";
+    case 8: return Prefix + "64_t";
+    case 16: return std::string(Unsigned ? "biara_u128" : "biara_i128");
+    default: return Asserted;
+    }
+}
 std::string Types::fieldTy(const Field &F) {
+    if (!F.Asserted.empty())
+        return canonInt(F.Bytes, F.Asserted);
     if (F.Embed >= 0)
       return Layouts.at(F.Embed).Name;
     if (F.Pointee >= 0) {
@@ -1092,7 +1142,6 @@ std::string Types::fieldTy(const Field &F) {
 
     return uintTy(F.Bytes * 8);
 }
-
 size_t Types::debugFrames(Module &M) {
     size_t Renamed = 0;
     for (auto &[Root, L] : Frames) {
@@ -1157,6 +1206,65 @@ size_t Types::debugFrames(Module &M) {
     return Renamed;
 }
 
+// User-declared struct bindings over shared layouts, applied per bound
+// lane only (never by shape matching across unrelated layouts). Each
+// request names one layout class plus the declared fields; the class
+// takes the declared struct name, covered fields take declared names
+// and asserted types, declared padding gaps are preserved, and extra
+// declared fields beyond the recovered extent ride along as asserted
+// members. Width mismatches on covered fields leave the layout
+// untouched (the caller validates them first).
+int Types::bindStructs(const std::vector<std::tuple<int, std::string, std::vector<Field>>> &Binds) {
+    int Renamed = 0;
+    for (auto &[Class, Name, Fields] : Binds) {
+        auto It = Layouts.find(Class);
+        if (It == Layouts.end() || It->second.Scalar)
+            continue;
+        Layout &L = It->second;
+        bool Covers = !L.Fields.empty();
+        for (const Field &F : L.Fields) {
+            bool Hit = false;
+            for (const Field &D : Fields)
+                if (D.Off == F.Off && D.Bytes == F.Bytes) {
+                    Hit = true;
+                    break;
+                }
+            if (!Hit) {
+                Covers = false;
+                break;
+            }
+        }
+        if (!Covers)
+            continue;
+        L.Name = "struct " + Name;
+        std::map<int64_t, Field> Merged;
+        for (const Field &F : L.Fields)
+            Merged[F.Off] = F;
+        for (const Field &D : Fields) {
+            auto F = Merged.find(D.Off);
+            if (F != Merged.end() && F->second.Bytes == D.Bytes) {
+                F->second.Name = D.Name;
+                F->second.Asserted = D.Asserted;
+                F->second.Debug = true;
+            } else if (F == Merged.end()) {
+                Field Extra;
+                Extra.Off = D.Off;
+                Extra.Bytes = D.Bytes;
+                Extra.Name = D.Name;
+                Extra.Asserted = D.Asserted;
+                Extra.Debug = true;
+                Merged[D.Off] = Extra;
+                if (D.Off + (int64_t)D.Bytes > (int64_t)L.Size)
+                    L.Size = D.Off + D.Bytes;
+            }
+        }
+        L.Fields.clear();
+        for (auto &[Off, F] : Merged)
+            L.Fields.push_back(F);
+        ++Renamed;
+    }
+    return Renamed;
+}
 
 struct BiaraLayouts {
   Types T;
@@ -1389,7 +1497,7 @@ std::string exportJson(const BiaraLayouts &L) {
       S += (FF ? "" : ",") + std::string("{\"off\":") + std::to_string(F.Off) + ",\"bytes\":" +
            std::to_string(F.Bytes) + ",\"pointee\":" +
            (F.Pointee >= 0 && P != L.E.IdOf.end() ? std::to_string(P->second) : "null") +
-           ",\"name\":" + jsonStr(F.Name) + "}";
+           ",\"name\":" + jsonStr(F.Name) + ",\"asserted\":" + jsonStr(F.Asserted) + "}";
       FF = false;
     }
     S += "],\"functions\":[";
@@ -1515,6 +1623,33 @@ int biara_layouts_apply_debug(BiaraLayouts *L, LLVMModuleRef MRef) {
     return 0;
   } catch (...) {
     return 1;
+  }
+}
+
+int biara_layouts_bind_structs(BiaraLayouts *L, const int *Classes, const struct BiaraStruct *Structs, size_t NBinds) {
+  if (!L)
+    return -1;
+  try {
+    std::vector<std::tuple<int, std::string, std::vector<biara_layouts::Field>>> Binds;
+    for (size_t I = 0; I < NBinds; ++I) {
+      if (!Structs[I].name)
+        return -1;
+      std::vector<biara_layouts::Field> Fields;
+      for (size_t K = 0; K < Structs[I].nfields; ++K) {
+        if (!Structs[I].fields[K].name || !Structs[I].fields[K].type)
+          return -1;
+        biara_layouts::Field F;
+        F.Off = Structs[I].fields[K].off;
+        F.Bytes = Structs[I].fields[K].bytes;
+        F.Name = Structs[I].fields[K].name;
+        F.Asserted = Structs[I].fields[K].type;
+        Fields.push_back(F);
+      }
+      Binds.push_back({Classes[I], Structs[I].name, Fields});
+    }
+    return L->T.bindStructs(Binds);
+  } catch (...) {
+    return -1;
   }
 }
 

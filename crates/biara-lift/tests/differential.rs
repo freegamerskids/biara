@@ -12,7 +12,7 @@
 use std::{arch::global_asm, collections::BTreeSet, ptr::addr_of};
 
 use biara_cfg::{Cfg, ExitKind};
-use biara_lift::{RUN, ResolveOptions, host_machine, lift, optimize, recover_resolving};
+use biara_lift::{RUN, ResolveOptions, analysis_machine, lift, optimize, recover_resolving};
 use biara_tcg::Libtcg;
 use inkwell::{OptimizationLevel, context::Context};
 
@@ -361,7 +361,7 @@ fn recover_at(entries: &[u64]) -> (Shared, Cfg) {
     };
     let cfg = recover_resolving(
         &mut *lib,
-        &host_machine().unwrap(),
+        &analysis_machine().unwrap(),
         &|pc| (begin..end).contains(&pc).then_some((code, begin)),
         &read,
         entries,
@@ -398,7 +398,7 @@ fn check(name: &str, f: TestFn) {
 
     let env = lib.env();
     let pristine = unsafe { std::slice::from_raw_parts(env, info.env_size) }.to_vec();
-    let machine = host_machine().unwrap();
+    let machine = analysis_machine().unwrap();
 
     // Plain lifting, and trusting the recovered calling conventions.
     let abis = biara_abi::analyze(&cfg, &info).unwrap();
@@ -410,7 +410,7 @@ fn check(name: &str, f: TestFn) {
             optimize(&module, &machine, opt).unwrap();
         }
         let ee = module
-            .create_jit_execution_engine(OptimizationLevel::None)
+            .create_jit_execution_engine /* native JIT: module under test was lifted with analysis_machine */(OptimizationLevel::None)
             .unwrap();
         for h in cfg.helpers() {
             if let Some(decl) = module.get_function(&h.symbol()) {

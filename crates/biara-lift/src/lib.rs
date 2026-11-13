@@ -45,25 +45,27 @@ pub mod output;
 mod packages;
 pub mod signatures;
 mod tables;
+pub(crate) mod tokens;
 
+pub use biara_proto::{
+    FunctionPackage, PackageDependency, PackageFunctionSymbol, PackageGlobalSymbol, PackageName,
+    PackageStatement, PackageSymbols, PackageTypeSymbol, ReadabilityMetrics,
+};
 pub use calls::{Arg, CallSite, CallSites, Callee, SizeRange, import_calls};
 pub use concurrency::DecompileOptions;
-pub use decompile::{CStats, PreparedC, TransformedC, TypeFacts, prepare_c};
+pub use decompile::{CStats, PreparedC, TransformedC, TypeFacts, prepare_c, prepare_c_selected};
 pub use integer::IntOp;
 pub use layouts::{
     ArgLayout, FactStatus, FrameLayout, LayoutConflict, LayoutFacts, LayoutField, LayoutLimits,
     ReturnLayout, SharedLayout,
 };
-pub use packages::{
-    DebugName, DebugObject, FunctionPackage, PackageDependency, PackageName, PackageStatement,
-    ReadabilityMetrics,
-};
+pub use packages::{DebugName, DebugObject};
 pub use signatures::{AbiResult, AbiTy, FuncSig, RetClass, summarize};
 pub use tables::{
     RecoveryBackend, RecoverySnapshot, RecoveryState, ResolutionArtifact, ResolveOptions,
     SiteResolution, analyze_resolution, recover_resolving, resolution_view,
 };
-
+pub mod annotations;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -108,8 +110,42 @@ pub enum Error {
     Tcg(#[from] biara_tcg::Error),
 }
 
-/// The host target machine; lifted modules use its triple and data layout.
-pub fn host_machine() -> Result<TargetMachine, Error> {
+// The analysis target is part of the portable service protocol and cache key.
+use biara_proto::ANALYSIS_TRIPLE;
+/// Little-endian 64-bit data layout implied by [`ANALYSIS_TRIPLE`].
+/// Asserted on every machine construction so a backend change is loud.
+const ANALYSIS_DATA_LAYOUT_PREFIX: &str = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128";
+pub fn analysis_machine() -> Result<TargetMachine, Error> {
+    Target::initialize_x86(&InitializationConfig::default());
+    let triple = inkwell::targets::TargetTriple::create(ANALYSIS_TRIPLE);
+    let target = Target::from_triple(&triple).map_err(|e| Error::Llvm(e.to_string()))?;
+    let machine = target
+        .create_target_machine(
+            &triple,
+            "generic",
+            "",
+            OptimizationLevel::Default,
+            RelocMode::Default,
+            CodeModel::Default,
+        )
+        .ok_or_else(|| Error::Llvm(format!("no target machine for {ANALYSIS_TRIPLE}")))?;
+    let data = machine.get_target_data();
+    let layout = data.get_data_layout();
+    if !layout
+        .as_str()
+        .to_bytes()
+        .starts_with(ANALYSIS_DATA_LAYOUT_PREFIX.as_bytes())
+    {
+        return Err(Error::Llvm(format!(
+            "unexpected data layout for {ANALYSIS_TRIPLE}: {}",
+            layout.as_str().to_string_lossy()
+        )));
+    }
+    Ok(machine)
+}
+/// Native execution machine for genuine JIT consumers (tests that execute
+/// lifted code in-process). Never used for analysis output or cache keys.
+pub fn native_machine() -> Result<TargetMachine, Error> {
     Target::initialize_native(&InitializationConfig::default()).map_err(Error::Llvm)?;
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple).map_err(|e| Error::Llvm(e.to_string()))?;
@@ -118,7 +154,7 @@ pub fn host_machine() -> Result<TargetMachine, Error> {
             &triple,
             "generic",
             "",
-            OptimizationLevel::Default,
+            OptimizationLevel::None,
             RelocMode::Default,
             CodeModel::Default,
         )
@@ -145,11 +181,11 @@ pub fn lift<'ctx>(
 
 /// A module for an analysis rather than for running.
 pub(crate) struct Analysis<'a> {
-    /// The functions that get bodies; calls to others go through
-    /// `biara.dispatch`.
-    pub only: &'a BTreeSet<u64>,
+    /// The functions that get bodies; known callees get declarations,
+    /// while unknown targets go through `biara.dispatch`.
+    pub(crate) only: &'a BTreeSet<u64>,
     /// Announce indirect call and jump targets to the resolver.
-    pub target_markers: bool,
+    pub(crate) target_markers: bool,
 }
 
 /// `lift`, or (`analysis`) a module of some of the functions.
@@ -182,21 +218,26 @@ fn lift_with<'ctx>(
     };
 
     let lifted = |e: &u64| analysis.as_ref().is_none_or(|a| a.only.contains(e));
-    // Analysis batches still need named declarations for recovered indirect
-    // callees. Omitting their bodies must not erase call/return relationships.
-    let indirect_dependencies: BTreeSet<u64> = analysis.as_ref().map_or_else(BTreeSet::new, |a| {
+    // Selected modules retain declarations for both direct and recovered
+    // indirect callees so native ABI rewriting preserves call relationships.
+    let dependencies: BTreeSet<u64> = analysis.as_ref().map_or_else(BTreeSet::new, |a| {
         a.only
             .iter()
             .filter_map(|e| cfg.functions.get(e))
-            .flat_map(|f| &f.blocks)
-            .filter_map(|b| cfg.indirect_calls.get(b))
-            .flat_map(|targets| targets.targets.iter().copied())
+            .flat_map(|f| {
+                f.calls.iter().chain(&f.tail_calls).copied().chain(
+                    f.blocks
+                        .iter()
+                        .filter_map(|b| cfg.indirect_calls.get(b))
+                        .flat_map(|targets| targets.targets.iter().copied()),
+                )
+            })
             .collect()
     });
     let functions: HashMap<u64, FunctionValue> = cfg
         .functions
         .keys()
-        .filter(|e| lifted(e) || indirect_dependencies.contains(e))
+        .filter(|e| lifted(e) || dependencies.contains(e))
         .map(|&e| {
             let f = declare(&name_of(e).unwrap_or_else(|| format!("sub_{e:x}")));
             f.add_attribute(AttributeLoc::Param(0), noalias);

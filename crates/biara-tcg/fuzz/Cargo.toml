@@ -1,0 +1,28 @@
+[package]
+name = "biara-tcg-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+biara-tcg = { path = "..", features = ["fuzzing"] }
+parking_lot = "0.12"
+
+[[bin]]
+name = "decode_block"
+path = "fuzz_targets/decode_block.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "translate_hostile"
+path = "fuzz_targets/translate_hostile.rs"
+test = false
+doc = false
+
+[workspace]

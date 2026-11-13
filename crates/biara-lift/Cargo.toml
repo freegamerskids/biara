@@ -4,11 +4,14 @@ description = "TCG to LLVM IR lowering and LLVM-level analyses"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 biara-abi.workspace = true
+biara-proto.workspace = true
 biara-cfg.workspace = true
 biara-tcg.workspace = true
+biara-loader.workspace = true
 inkwell.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -20,5 +23,4 @@ cc.workspace = true
 
 [dev-dependencies]
 parking_lot.workspace = true
-biara-loader.workspace = true
 libc.workspace = true

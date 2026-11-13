@@ -6,6 +6,7 @@
 
 use std::{fmt, sync::Arc};
 
+use crate::Error;
 pub type TempId = u32;
 pub type LabelId = u32;
 
@@ -20,15 +21,15 @@ pub enum Type {
 }
 
 impl Type {
-    pub(crate) fn from_raw(v: u8) -> Self {
+    pub(crate) fn from_raw(v: u8) -> Result<Self, Error> {
         match v {
-            0 => Self::I32,
-            1 => Self::I64,
-            2 => Self::I128,
-            3 => Self::V64,
-            4 => Self::V128,
-            5 => Self::V256,
-            _ => panic!("libtcg: unknown TCGType {v}"),
+            0 => Ok(Self::I32),
+            1 => Ok(Self::I64),
+            2 => Ok(Self::I128),
+            3 => Ok(Self::V64),
+            4 => Ok(Self::V128),
+            5 => Ok(Self::V256),
+            _ => Err(Error::UnknownType(v)),
         }
     }
 
@@ -57,14 +58,14 @@ pub enum TempKind {
 }
 
 impl TempKind {
-    pub(crate) fn from_raw(v: u8) -> Self {
+    pub(crate) fn from_raw(v: u8) -> Result<Self, Error> {
         match v {
-            0 => Self::Ebb,
-            1 => Self::Tb,
-            2 => Self::Global,
-            3 => Self::Fixed,
-            4 => Self::Const,
-            _ => panic!("libtcg: unknown TCGTempKind {v}"),
+            0 => Ok(Self::Ebb),
+            1 => Ok(Self::Tb),
+            2 => Ok(Self::Global),
+            3 => Ok(Self::Fixed),
+            4 => Ok(Self::Const),
+            _ => Err(Error::UnknownTempKind(v)),
         }
     }
 }
@@ -194,8 +195,11 @@ pub(crate) struct OpDefs {
     pub opcodes: Vec<Opcode>,
     /// TCG_OPF_* per opcode.
     pub flags: Vec<u16>,
+    /// Declared `(nb_oargs, nb_iargs, nb_cargs)` per opcode, from
+    /// `libtcg_op_defs()`. `Call` is dynamic (per-op counts always apply);
+    /// every other opcode must carry exactly its declared arity.
+    pub arities: Vec<(u8, u8, u8)>,
 }
-
 /// TCG_OPF_INT: integer op, `Op::ty` is the operand type.
 const OPF_INT: u16 = 0x10;
 /// TCG_OPF_VECTOR: vector op, `Op::ty` and `Op::vece` are set.
@@ -356,16 +360,16 @@ pub enum HelperType {
 }
 
 impl HelperType {
-    fn from_code(c: u32) -> Self {
+    fn from_code(c: u32) -> Result<Self, Error> {
         match c {
-            0 => Self::Void,
-            2 => Self::I32,
-            3 => Self::S32,
-            4 => Self::I64,
-            5 => Self::S64,
-            6 => Self::Ptr,
-            7 => Self::I128,
-            _ => panic!("libtcg: unknown helper typecode {c}"),
+            0 => Ok(Self::Void),
+            2 => Ok(Self::I32),
+            3 => Ok(Self::S32),
+            4 => Ok(Self::I64),
+            5 => Ok(Self::S64),
+            6 => Ok(Self::Ptr),
+            7 => Ok(Self::I128),
+            _ => Err(Error::UnknownHelperType(c)),
         }
     }
 }
@@ -385,15 +389,27 @@ impl Helper {
         format!("helper_{}", self.name)
     }
 
-    pub fn ret(&self) -> HelperType {
+    pub fn ret(&self) -> Result<HelperType, Error> {
         HelperType::from_code(self.typemask & 7)
     }
 
-    pub fn params(&self) -> impl Iterator<Item = HelperType> + '_ {
+    /// Signature slots after the return slot (up to 10). Each item is
+    /// validated: unknown typecodes surface as `Err`, never truncation.
+    /// Note `take_while` stops at the first zero slot, so a zero return
+    /// slot with nonzero param slots still yields those params.
+    pub fn params(&self) -> impl Iterator<Item = Result<HelperType, Error>> + '_ {
         (1..=10)
             .map(|slot| (self.typemask >> (slot * 3)) & 7)
             .take_while(|&c| c != 0)
             .map(HelperType::from_code)
+    }
+
+    /// Eager validated parameter list (convenience over `params`).
+    /// Also validates the return slot: unknown codes are `Err` even when
+    /// no parameter slots are present.
+    pub fn params_vec(&self) -> Result<Vec<HelperType>, Error> {
+        let _ = self.ret()?;
+        self.params().collect()
     }
 
     pub fn no_return(&self) -> bool {

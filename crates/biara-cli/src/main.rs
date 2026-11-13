@@ -17,6 +17,7 @@ mod decomp;
 mod json;
 mod parallelism;
 mod quality;
+mod service;
 
 static PROCESS_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
@@ -47,7 +48,11 @@ enum Cmd {
     /// Measure function/edge recall for identical mapped code against a symbol oracle.
     Quality(quality::QualityArgs),
     #[command(name = "__worker", hide = true)]
-    Worker { config: String },
+    EngineWorker { config: String },
+    /// Run a provider-independent JSON job from a file or stdin.
+    Worker(service::WorkerArgs),
+    #[command(name = "__service", hide = true)]
+    Service { directory: PathBuf },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -131,6 +136,12 @@ struct LiftArgs {
     /// Schema 1 migrates automatically: job artifacts remain, old graph snapshots retire.
     #[arg(long)]
     database: Option<PathBuf>,
+    /// Analysis memory budget in MiB, including recovery workers.
+    #[arg(long, default_value_t = 4096)]
+    memory_mib: u64,
+    /// User names, signatures and struct layouts (JSON or TOML).
+    #[arg(long)]
+    annotations: Option<PathBuf>,
     #[command(flatten)]
     decomp: decomp::Options,
 }
@@ -141,7 +152,9 @@ fn main() -> Result<()> {
         Cmd::Lift(a) => lift(a),
         Cmd::Diff(a) => diff(a),
         Cmd::Quality(a) => quality::run(a),
-        Cmd::Worker { config } => biara_engine::worker(&config).map_err(Into::into),
+        Cmd::EngineWorker { config } => biara_engine::worker(&config).map_err(Into::into),
+        Cmd::Worker(a) => service::worker(a),
+        Cmd::Service { directory } => service::execute(&directory),
     }
 }
 
@@ -207,17 +220,25 @@ fn lift(a: LiftArgs) -> Result<()> {
     a.decomp.validate(matches!(a.emit, Emit::Decomp))?;
     // Capture one shared budget before restricting affinity. Recovery workers
     // and downstream analyses reuse it rather than subtracting a CPU again.
-    let decomp_options = parallelism::resolve(a.jobs)?;
+    let memory_bytes = a
+        .memory_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("memory budget overflow"))?;
+    let decomp_options = parallelism::resolve(a.jobs, memory_bytes)?;
+    let annotations = service::load_annotations(a.annotations.as_deref())?;
     let (image, cfg, lib) = recover(
         &a.binary,
         &a.at,
-        a.max_blocks,
         a.libtcg.as_deref(),
         a.cpu.as_deref(),
         a.database.as_deref(),
-        decomp_options.workers(),
+        RecoveryBudget {
+            max_blocks: a.max_blocks,
+            workers: decomp_options.workers(),
+            memory_bytes,
+        },
     )?;
-    let machine = biara_lift::host_machine()?;
+    let machine = biara_lift::analysis_machine()?;
     report_issues(&cfg);
     eprintln!(
         "{} functions, {} blocks, {} incomplete-analysis facts",
@@ -226,9 +247,11 @@ fn lift(a: LiftArgs) -> Result<()> {
         cfg.issues().count()
     );
     let name_of = |addr: u64| {
-        image
-            .function_at(addr)
-            .map(|f| f.name.clone())
+        annotations
+            .functions
+            .get(&addr)
+            .and_then(|f| f.name.clone())
+            .or_else(|| image.function_at(addr).map(|f| f.name.clone()))
             .or_else(|| cfg.stub_import(addr).map(|i| format!("{i}@plt")))
     };
     let label = |addr: u64| name_of(addr).map(|n| format!(" <{n}>")).unwrap_or_default();
@@ -243,7 +266,7 @@ fn lift(a: LiftArgs) -> Result<()> {
             .file_name()
             .map_or("lifted".into(), |n| n.to_string_lossy());
         let arch = image.arch;
-        let abis = if a.no_abi {
+        let mut abis = if a.no_abi {
             None
         } else {
             Some(biara_abi::analyze_with_workers(
@@ -252,6 +275,20 @@ fn lift(a: LiftArgs) -> Result<()> {
                 decomp_options.workers(),
             )?)
         };
+        if let Some(abis) = &mut abis {
+            biara_lift::annotations::apply_abi_annotations(
+                &cfg,
+                lib.lock().info(),
+                abis,
+                &annotations,
+            )?;
+        } else if annotations
+            .functions
+            .values()
+            .any(|f| f.signature.is_some())
+        {
+            bail!("explicit signatures require ABI analysis; remove --no-abi");
+        }
         let module = {
             let guard = lib.lock();
             biara_lift::lift(
@@ -306,14 +343,20 @@ fn lift(a: LiftArgs) -> Result<()> {
             bail!("nothing to decompile");
         }
         let cx = Context::create();
-        let abis =
+        let mut abis =
             biara_abi::analyze_with_workers(&cfg, lib.lock().info(), decomp_options.workers())?;
+        biara_lift::annotations::apply_abi_annotations(
+            &cfg,
+            lib.lock().info(),
+            &mut abis,
+            &annotations,
+        )?;
         let banner = format!(
             "Decompiled by biara from {} ({}).",
             a.binary.display(),
             image.arch
         );
-        let prepared = {
+        let mut prepared = {
             let guard = lib.lock();
             biara_lift::prepare_c(
                 &cx,
@@ -326,6 +369,7 @@ fn lift(a: LiftArgs) -> Result<()> {
                 &image.data,
             )?
         };
+        prepared.apply_annotations(&annotations)?;
         drop(abis);
         let report_cfg = matches!(a.emit, Emit::Types).then_some(cfg);
         drop(lib);
@@ -334,7 +378,8 @@ fn lift(a: LiftArgs) -> Result<()> {
             &|addr, buf| image.read_const(addr, buf),
             decomp_options,
         )?;
-        decomp::apply_debug(&mut transformed, &image);
+        transformed.apply_image_debug(&image);
+        transformed.apply_annotations(&annotations)?;
         if matches!(a.emit, Emit::Types) {
             let facts = transformed.type_facts()?;
             return json::types(&a, &image, report_cfg.as_ref().unwrap(), &facts);
@@ -363,9 +408,22 @@ fn lift(a: LiftArgs) -> Result<()> {
             lib.info(),
             &machine,
             decomp_options.workers(),
+            &annotations,
         );
     }
 
+    let mut abis = if matches!(a.emit, Emit::Abi | Emit::Calls | Emit::Audit) {
+        Some(biara_abi::analyze_with_workers(
+            &cfg,
+            lib.info(),
+            decomp_options.workers(),
+        )?)
+    } else {
+        None
+    };
+    if let Some(abis) = &mut abis {
+        biara_lift::annotations::apply_abi_annotations(&cfg, lib.info(), abis, &annotations)?;
+    }
     let text = match a.emit {
         Emit::Tcg => {
             let mut s = String::new();
@@ -406,7 +464,7 @@ fn lift(a: LiftArgs) -> Result<()> {
         }
         Emit::Abi => {
             let info = lib.info();
-            let abis = biara_abi::analyze_with_workers(&cfg, info, decomp_options.workers())?;
+            let abis = abis.as_ref().unwrap();
             let spec = cfg.spec(&info.arch)?;
             // Report in terms of the convention's registers, in its order.
             let regs: Vec<(u32, &str)> = spec
@@ -434,7 +492,7 @@ fn lift(a: LiftArgs) -> Result<()> {
                 }
             };
             let mut s = String::new();
-            for (entry, abi) in &abis {
+            for (entry, abi) in abis {
                 let stack_args: Vec<String> =
                     abi.stack_args.iter().map(|o| format!("+{o}")).collect();
                 s += &format!(
@@ -485,9 +543,11 @@ fn lift(a: LiftArgs) -> Result<()> {
             s
         }
         Emit::Calls => {
-            let calls = biara_lift::import_calls(&machine, lib.info(), &cfg)?;
+            let mut sites =
+                biara_lift::CallSites::with_abis(&machine, lib.info(), &cfg, abis.take())?;
+            sites.add(&sites.import_callers())?;
             let mut s = String::new();
-            for c in &calls {
+            for c in sites.sites().iter().filter(|c| c.import().is_some()) {
                 let import = c.import().unwrap_or_default();
                 // The arguments the import is known to take, else those up
                 // to the last one the caller set.
@@ -511,7 +571,8 @@ fn lift(a: LiftArgs) -> Result<()> {
             s
         }
         Emit::Audit => {
-            let mut sites = biara_lift::CallSites::new(&machine, lib.info(), &cfg)?;
+            let mut sites =
+                biara_lift::CallSites::with_abis(&machine, lib.info(), &cfg, abis.take())?;
             let findings = biara_lift::audit::audit(
                 &mut sites,
                 &image.indirect_entries(),
@@ -562,6 +623,9 @@ struct DiffArgs {
     /// Shared analysis workers; capped to available logical CPUs minus one.
     #[arg(long)]
     jobs: Option<NonZeroUsize>,
+    /// Total analysis memory budget in MiB.
+    #[arg(long, default_value_t = 4096)]
+    memory_mib: u64,
     /// Persistent analysis database; default content-addressed user cache.
     #[arg(long)]
     database: Option<PathBuf>,
@@ -575,15 +639,21 @@ struct DiffArgs {
 /// Load `path`, recover the whole program (entry point, symbols, unwind
 /// and function lists, code pointers), and return the image, its CFG, and
 /// the locked libtcg for its architecture.
+#[derive(Clone, Copy)]
+struct RecoveryBudget {
+    max_blocks: usize,
+    workers: usize,
+    memory_bytes: u64,
+}
 fn recover(
     path: &Path,
     at: &[String],
-    max_blocks: usize,
     libtcg: Option<&Path>,
     cpu: Option<&str>,
     database: Option<&Path>,
-    workers: usize,
+    budget: RecoveryBudget,
 ) -> Result<(Image, biara_cfg::Cfg, Arc<Mutex<Libtcg>>)> {
+    service::limit_address_space(budget.memory_bytes / 2)?;
     let image = Image::load(path).with_context(|| path.display().to_string())?;
     let (entries, discovery): (Vec<u64>, _) = if at.is_empty() {
         let discovery = biara_cfg::Discovery {
@@ -606,7 +676,7 @@ fn recover(
     let opts = biara_lift::ResolveOptions {
         cfg: biara_cfg::Options {
             os: image.os,
-            max_blocks,
+            max_blocks: budget.max_blocks,
             imports: image.imports.clone(),
             discovery,
             function_starts: image.function_starts(),
@@ -620,7 +690,8 @@ fn recover(
             libtcg: lib_path,
             cpu: cpu.map(str::to_owned),
             database: database.map(Path::to_owned),
-            workers,
+            workers: budget.workers,
+            memory_budget: budget.memory_bytes,
             executable: std::env::current_exe()?,
         },
         &entries,
@@ -629,7 +700,7 @@ fn recover(
     let lib = session.lib();
     let cfg = biara_lift::recover_resolving(
         &mut session,
-        &biara_lift::host_machine()?,
+        &biara_lift::analysis_machine()?,
         &|pc| image.code_at(pc),
         &|addr, buf| image.read_const(addr, buf),
         &entries,
@@ -648,38 +719,36 @@ fn diff(a: DiffArgs) -> Result<()> {
             bail!("{kind}: --show takes same, changed, uncertain, added, removed");
         }
     }
-    let show_same = a.show.iter().any(|k| k == "same");
-    let show = |m: &biara_diff::Match| match m {
-        biara_diff::Match::Same { .. } => show_same,
-        biara_diff::Match::Changed { .. } => {
-            a.show.is_empty() || a.show.iter().any(|k| k == "changed")
-        }
-        biara_diff::Match::Uncertain { .. } => {
-            a.show.is_empty() || a.show.iter().any(|k| k == "uncertain")
-        }
-        biara_diff::Match::Added { .. } => a.show.is_empty() || a.show.iter().any(|k| k == "added"),
-        biara_diff::Match::Removed { .. } => {
-            a.show.is_empty() || a.show.iter().any(|k| k == "removed")
-        }
-    };
-    let workers = parallelism::resolve(a.jobs)?.workers();
+    let show =
+        |kind: &str| (a.show.is_empty() && kind != "same") || a.show.iter().any(|k| k == kind);
+    let memory_bytes = a
+        .memory_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("memory budget overflow"))?;
+    let workers = parallelism::resolve(a.jobs, memory_bytes)?.workers();
     let (old_image, old_cfg, _) = recover(
         &a.old,
         &[],
-        a.max_blocks,
         None,
         a.cpu.as_deref(),
         a.database.as_deref(),
-        workers,
+        RecoveryBudget {
+            max_blocks: a.max_blocks,
+            workers,
+            memory_bytes,
+        },
     )?;
     let (new_image, new_cfg, _) = recover(
         &a.new,
         &[],
-        a.max_blocks,
         None,
         a.cpu.as_deref(),
         a.database.as_deref(),
-        workers,
+        RecoveryBudget {
+            max_blocks: a.max_blocks,
+            workers,
+            memory_bytes,
+        },
     )?;
     let old = biara_diff::Program::new(&old_cfg, &old_image);
     let new = biara_diff::Program::new(&new_cfg, &new_image);
@@ -688,8 +757,18 @@ fn diff(a: DiffArgs) -> Result<()> {
             eprintln!("{side} comparison uncertainty: {issue:?}");
         }
     }
-    let matches = biara_diff::diff(&old, &new);
     if matches!(a.format, Format::Json) {
+        use biara_proto::diff::FunctionKind;
+        let mut report = biara_diff::compare(&old, &new);
+        report.functions.retain(|m| {
+            show(match m.kind {
+                FunctionKind::Same => "same",
+                FunctionKind::Changed => "changed",
+                FunctionKind::Uncertain => "uncertain",
+                FunctionKind::Added => "added",
+                FunctionKind::Removed => "removed",
+            })
+        });
         return json::diff(
             &a,
             json::DiffInput {
@@ -702,12 +781,20 @@ fn diff(a: DiffArgs) -> Result<()> {
                 cfg: &new_cfg,
                 program: &new,
             },
-            &matches.iter().filter(|m| show(m)).collect::<Vec<_>>(),
+            &report,
         );
     }
+    let matches = biara_diff::diff(&old, &new);
     let mut s = String::new();
     for m in &matches {
-        if show(m) {
+        let kind = match m {
+            biara_diff::Match::Same { .. } => "same",
+            biara_diff::Match::Changed { .. } => "changed",
+            biara_diff::Match::Uncertain { .. } => "uncertain",
+            biara_diff::Match::Added { .. } => "added",
+            biara_diff::Match::Removed { .. } => "removed",
+        };
+        if show(kind) {
             s += &format!("{}\n", biara_diff::describe(m, &old, &new));
         }
     }

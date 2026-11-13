@@ -10,7 +10,7 @@ mod common;
 
 use std::process::Command;
 
-use biara_lift::{ResolveOptions, host_machine, recover_resolving};
+use biara_lift::{ResolveOptions, analysis_machine, recover_resolving};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 use common::{linker, tmp};
@@ -42,7 +42,7 @@ fn many() {
     let image = Image::load(&bin).unwrap();
     let shared = Libtcg::load(&Libtcg::find("x86_64").expect("libtcg"), None).unwrap();
     let mut lib = shared.lock();
-    let machine = host_machine().unwrap();
+    let machine = analysis_machine().unwrap();
     let entries: Vec<u64> = image.function_starts().into_iter().collect();
     let cfg = recover_resolving(
         &mut *lib,
@@ -85,7 +85,7 @@ fn many() {
             biara_lift::optimize(&module, &machine, opt).unwrap();
         }
         let ee = module
-            .create_jit_execution_engine(OptimizationLevel::None)
+            .create_jit_execution_engine /* native JIT: module under test was lifted with analysis_machine */(OptimizationLevel::None)
             .unwrap();
         for h in cfg.helpers() {
             if let Some(decl) = module.get_function(&h.symbol()) {

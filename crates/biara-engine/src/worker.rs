@@ -149,7 +149,7 @@ pub fn worker(config: &str) -> Result<(), Error> {
                     // The wire representation is not analysis state. Release
                     // it before constructing the much larger LLVM graph.
                     drop(cfg);
-                    let machine = biara_lift::host_machine()?;
+                    let machine = biara_lift::analysis_machine()?;
                     let artifact = biara_lift::analyze_resolution(
                         &graph,
                         lib.info(),
@@ -194,7 +194,22 @@ pub(crate) struct Pool {
     output: mpsc::Receiver<(usize, Result<Response, Error>)>,
 }
 impl Pool {
-    pub fn new(executable: &std::path::Path, config: &Config, count: usize) -> Result<Self, Error> {
+    /// Spawn `count` workers, each inheriting an address-space cap of
+    /// `worker_budget` bytes. Workers inherit the coordinator's process group
+    /// (no per-worker `process_group(0)`): the supervisor isolates the
+    /// coordinator once and group RSS/kill covers the whole job; `Drop` kills
+    /// each worker PID directly. Unix hard caps only lower, so the
+    /// coordinator-half ceiling stays intact and coordinator half plus worker
+    /// shares sum within the total budget by construction.
+    pub fn new(
+        executable: &std::path::Path,
+        config: &Config,
+        count: usize,
+        worker_budget: u64,
+    ) -> Result<Self, Error> {
+        if count == 0 {
+            return Err(Error::Engine("worker budget must be nonzero".into()));
+        }
         let (sender, output) = mpsc::channel();
         let mut pool = Self {
             processes: Vec::with_capacity(count),
@@ -202,13 +217,45 @@ impl Pool {
         };
         let config = serde_json::to_string(config)?;
         for index in 0..count {
-            let mut child = Command::new(executable)
+            let mut child = Command::new(executable);
+            child
                 .arg("__worker")
                 .arg(&config)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()?;
+                .stderr(Stdio::inherit());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // Inherit the coordinator's process group: the service supervisor
+                // isolates the coordinator once, and group RSS/kill then covers
+                // the whole job. A per-worker process_group(0) would escape
+                // supervision and orphan workers on coordinator SIGKILL.
+                unsafe {
+                    child.pre_exec(move || {
+                        let limit = libc::rlimit {
+                            rlim_cur: worker_budget as libc::rlim_t,
+                            rlim_max: worker_budget as libc::rlim_t,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        let core = libc::rlimit {
+                            rlim_cur: 0,
+                            rlim_max: 0,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = worker_budget;
+            }
+            let mut child = child.spawn()?;
             let input = child
                 .stdin
                 .take()
@@ -247,6 +294,9 @@ impl Pool {
         }
         Ok(pool)
     }
+    pub fn len(&self) -> usize {
+        self.processes.len()
+    }
     pub fn send(&mut self, index: usize, request: &Request) -> Result<(), Error> {
         write_frame(&mut self.processes[index].input, request)
     }
@@ -263,6 +313,9 @@ impl Pool {
     }
 }
 impl Drop for Pool {
+    /// Kill each worker PID directly (`Child::kill`, never a negative group
+    /// PID): workers share the coordinator's group, so group-kill belongs to
+    /// the supervisor that owns the whole job.
     fn drop(&mut self) {
         for process in &mut self.processes {
             let _ = process.child.kill();

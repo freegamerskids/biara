@@ -3,3 +3,6 @@
 biara_**.c
 biara_**.txt
 **.dll
+**/target
+**/artifacts
+mvp-plan.md

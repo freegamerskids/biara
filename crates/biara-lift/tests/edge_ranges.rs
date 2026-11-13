@@ -26,7 +26,7 @@ mod common;
 use std::{collections::BTreeSet, fs, process::Command};
 
 use biara_cfg::ExitKind;
-use biara_lift::{Arg, CallSites, Callee, audit::audit, host_machine};
+use biara_lift::{Arg, CallSites, Callee, analysis_machine, audit::audit};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 
@@ -130,7 +130,7 @@ fn assert_contains(arg: &Arg, must_contain: &[u64], max_hi: u64, what: &str, opt
 fn check(opt: u8) {
     let binary = build(opt);
     let image = Image::load(&binary).unwrap();
-    let machine = host_machine().unwrap();
+    let machine = analysis_machine().unwrap();
     let lib = Libtcg::load(&Libtcg::find("x86_64").unwrap(), None).unwrap();
     let mut lib = lib.lock();
     let cfg = common::recover_program(&mut lib, &image);

@@ -79,9 +79,9 @@ use inkwell::{
 };
 
 use crate::{
-    DISPATCH, DebugName, DebugObject, DecompileOptions, Error, FunctionPackage, RUN, SYSCALL,
-    lower::PC_MD, memory,
+    DISPATCH, DebugName, DebugObject, DecompileOptions, Error, RUN, SYSCALL, lower::PC_MD, memory,
 };
+use biara_proto::{FunctionPackage, annotations::Annotations};
 
 #[repr(C)]
 struct Reg {
@@ -107,8 +107,9 @@ struct Sig {
     preserved: *const u32,
     npreserved: u32,
     // Per-parameter ABI kinds (`KIND_*` below, length `nargs + nstack`;
-    // stack slots always `KIND_I64`). Null would mean all-integer, but Rust
-    // always passes the array.
+    // stack slots carry declared scalar kinds: `I64` default,
+    // `I8`/`I16`/`I32`/`BOOL` for declared spilled scalars).
+    // Null would mean all-integer, but Rust always passes the array.
     arg_kinds: *const u32,
     // Per-result ABI kinds (`KIND_*`, length `nrets`); always passed.
     ret_kinds: *const u32,
@@ -119,15 +120,23 @@ struct Sig {
 }
 
 // ABI value kinds: the native LLVM type a slot lowers to. Must match
-// `BIARA_KIND_*` in cpp/abi_form.cpp.
+// `BIARA_KIND_*` in cpp/abi_form.cpp. `BOOL` is `i1` transport for a
+// declared `_Bool`; `I32` marks a declared 32-bit lane whose transport
+// narrows the register word bit-exactly at the boundary (so `long` on
+// LLP64 vs LP64 keeps its declared width in the IR, not just in the
+// attribute).
 const KIND_I64: u32 = 1;
 const KIND_F32: u32 = 2;
 const KIND_F64: u32 = 3;
 const KIND_VEC128: u32 = 4;
+const KIND_PTR: u32 = 5;
 const KIND_SRET: u32 = 6;
 const KIND_RAW: u32 = 7;
 const KIND_CONFLICT: u32 = 8;
-// Return shapes; must match `BIARA_RET_*` in cpp/abi_form.cpp.
+const KIND_I8: u32 = 9;
+const KIND_I16: u32 = 10;
+const KIND_BOOL: u32 = 11;
+const KIND_I32: u32 = 12;
 const RET_DIRECT: u32 = 0;
 const RET_PAIR: u32 = 1;
 const RET_MEMORY: u32 = 2;
@@ -484,13 +493,19 @@ pub struct TransformedC<'ctx> {
     entries: BTreeMap<u64, String>,
     strings: Vec<(u64, String)>,
     protos: Vec<(String, u32, u64, bool)>,
+    structs: BTreeMap<String, biara_proto::annotations::StructAnnotation>,
 }
 
-/// Lift every function of `cfg` and put it in ABI form. The returned
-/// stage owns its module and compact summaries only; drop `cfg`, `abis`,
-/// and the libtcg guard before the expensive `transform`/`render`.
+/// Shared core of [`prepare_c`] and [`prepare_c_selected`]: compute unique
+/// names over `entries`, lift with `analysis`, and lower to ABI form.
+/// `entries` selects the functions that get bodies; when `None`, every
+/// function of `cfg` is lowered. Callers pass `&cfg.functions.keys()`
+/// themselves only via [`prepare_c`]; [`prepare_c_selected`] passes the
+/// requested subset plus directly referenced callees/stubs through
+/// [`crate::resolution_view`] before/after selection so bodies land lazily
+/// while signatures and call dependencies stay intact.
 #[allow(clippy::too_many_arguments)]
-pub fn prepare_c<'ctx>(
+fn prepare_c_with<'ctx>(
     cx: &'ctx Context,
     machine: &TargetMachine,
     info: &ContextInfo,
@@ -499,6 +514,7 @@ pub fn prepare_c<'ctx>(
     name_of: &dyn Fn(u64) -> Option<String>,
     banner: &str,
     data: &BTreeMap<u64, (String, u64)>,
+    analysis: Option<crate::Analysis<'_>>,
 ) -> Result<PreparedC<'ctx>, Error> {
     let spec = cfg.spec(&info.arch)?;
     // Unique names (symbols repeat across static functions): C needs them,
@@ -531,7 +547,7 @@ pub fn prepare_c<'ctx>(
         Some(abis),
         &|e| names.get(&e).cloned(),
         "c",
-        None,
+        analysis,
     )?;
 
     // Registers: every integer global in env, plus one synthetic lane
@@ -658,9 +674,16 @@ pub fn prepare_c<'ctx>(
         balanced: bool,
         preserved: Vec<u32>,
         arg_kinds: Vec<u32>,
+        stack_kinds: Vec<u32>,
         ret_kinds: Vec<u32>,
         ret_class: u32,
         sret_param: u32,
+        // Canonical declared C spellings aligned with the LLVM formals:
+        // `arg_spellings[i]` for register/stack formal `i`
+        // (`biara.c_type`), `ret_spelling` for the return
+        // (`biara.c_return`). Empty where undeclared.
+        arg_spellings: Vec<String>,
+        ret_spelling: String,
     }
     let stubs: BTreeSet<u64> = cfg
         .functions
@@ -683,6 +706,11 @@ pub fn prepare_c<'ctx>(
         };
         // Slots always name their physical homes. SysV/AAPCS64 have
         // independent integer/FP sequences; Win64 shares one sequence.
+        // Declared signatures (when present) drive the formal order:
+        // `explicit_order_*` preserves declaration order so
+        // `mixed(u64,double,u64,float)` emits interleaved LLVM formals
+        // `(i64,double,i64,float)`, not int-bank then FP-bank.
+        let declared = !abi.explicit_order_spellings.is_empty();
         let mut argsel = if abi.analysis.converged {
             prefix(&abi.args, &conv_args)
         } else {
@@ -702,10 +730,115 @@ pub fn prepare_c<'ctx>(
         };
         let fp_count = abi.fp_args.last().map_or(0, |lane| lane + 1);
         let mut arg_kinds = vec![KIND_I64; argsel.len()];
-        if spec.unknown_call.home != 0 {
+        // Declared spellings aligned with the recovered formals; the
+        // ordered path below rebuilds both vectors from the declaration.
+        let mut arg_spellings: Vec<String> = vec![String::new(); argsel.len()];
+        if declared {
+            // Rebuild register formals in declared interleaved order.
+            // Each `explicit_order_*` entry names one declared formal:
+            // lanes (register TempId) for register formals, `u32::MAX`
+            // for stack formals, `u32::MAX-1` for Win64 shared FP slots
+            // (position in `explicit_order_stack`), `u32::MAX-2` for
+            // split-sequence FP lanes (lane in `explicit_order_stack`).
+            let mut ordered: Vec<u32> = Vec::new();
+            let mut ordered_kinds: Vec<u32> = Vec::new();
+            let mut ordered_spellings: Vec<String> = Vec::new();
+            let mut seen_regs: BTreeSet<u32> = BTreeSet::new();
+            let mut seen_fp: BTreeSet<u32> = BTreeSet::new();
+            for ((&lane, &stack), spelling) in abi
+                .explicit_order_lanes
+                .iter()
+                .zip(&abi.explicit_order_stack)
+                .zip(&abi.explicit_order_spellings)
+            {
+                if lane == u32::MAX {
+                    // Stack formal: handled via the stack-arg path below
+                    // (spellings align there); skip here.
+                    continue;
+                } else if lane == u32::MAX - 1 {
+                    // Win64 shared FP slot at shared position `stack`.
+                    let position = stack as u32;
+                    if seen_fp.contains(&position) {
+                        continue;
+                    }
+                    seen_fp.insert(position);
+                    ordered.push(fp_index(position)?);
+                    ordered_kinds.push(kind(position, &abi.fp_arg_types));
+                    ordered_spellings.push(spelling.clone());
+                } else if lane == u32::MAX - 2 {
+                    // Split FP lane `stack`.
+                    let fp_lane = stack as u32;
+                    if seen_fp.contains(&fp_lane) {
+                        continue;
+                    }
+                    seen_fp.insert(fp_lane);
+                    ordered.push(fp_index(fp_lane)?);
+                    ordered_kinds.push(kind(fp_lane, &abi.fp_arg_types));
+                    ordered_spellings.push(spelling.clone());
+                } else {
+                    // Integer/pointer/bool register formal.
+                    let reg =
+                        index(lane).ok_or_else(|| Error::Llvm(format!("no ABI lane {lane}")))?;
+                    if seen_regs.contains(&reg) {
+                        continue;
+                    }
+                    seen_regs.insert(reg);
+                    ordered.push(reg);
+                    ordered_kinds.push(KIND_I64);
+                    ordered_spellings.push(spelling.clone());
+                }
+            }
+            // Append recovered lanes the declaration did not name. On a
+            // declared Win64 shared sequence the explicit order already
+            // names every position: recovered integer/FP state only
+            // aliases those positions (XMMn shadows the k-th slot), so
+            // appending it would invent a phantom fifth formal.
+            if declared && spec.unknown_call.home != 0 {
+                // Nothing to append: every shared position is declared.
+            } else {
+                for &reg in &argsel {
+                    if !seen_regs.contains(&reg) {
+                        ordered.push(reg);
+                        ordered_kinds.push(KIND_I64);
+                        ordered_spellings.push(String::new());
+                        seen_regs.insert(reg);
+                    }
+                }
+                if spec.unknown_call.home != 0 {
+                    let count = argsel.len().max(fp_count as usize);
+                    for position in 0..count as u32 {
+                        if seen_fp.contains(&position) {
+                            continue;
+                        }
+                        if abi.fp_args.contains(&position) {
+                            ordered.push(fp_index(position)?);
+                            ordered_kinds.push(kind(position, &abi.fp_arg_types));
+                            ordered_spellings.push(String::new());
+                            seen_fp.insert(position);
+                        }
+                    }
+                } else {
+                    for lane in 0..fp_count {
+                        if seen_fp.contains(&lane) {
+                            continue;
+                        }
+                        if abi.fp_args.contains(&lane) {
+                            ordered.push(fp_index(lane)?);
+                            ordered_kinds.push(kind(lane, &abi.fp_arg_types));
+                            ordered_spellings.push(String::new());
+                            seen_fp.insert(lane);
+                        }
+                    }
+                }
+            }
+            argsel = ordered;
+            arg_kinds = ordered_kinds;
+            arg_spellings = ordered_spellings;
+        } else if spec.unknown_call.home != 0 {
             let count = argsel.len().max(fp_count as usize);
             argsel.clear();
             arg_kinds.clear();
+            arg_spellings.clear();
             for (position, &reg) in conv_args.iter().enumerate().take(count) {
                 let lane = position as u32;
                 if abi.fp_args.contains(&lane) {
@@ -715,11 +848,49 @@ pub fn prepare_c<'ctx>(
                     argsel.push(reg);
                     arg_kinds.push(KIND_I64);
                 }
+                arg_spellings.push(String::new());
             }
         } else {
             for lane in 0..fp_count {
                 argsel.push(fp_index(lane)?);
                 arg_kinds.push(kind(lane, &abi.fp_arg_types));
+                arg_spellings.push(String::new());
+            }
+        }
+        // Explicit declared lanes lower to their LLVM transports.
+        // Integer/pointer transport is bit-exact (inttoptr/ptrtoint), so
+        // callers and callees agree on the slot type without changing
+        // guest bits; conflicting float lanes were already rejected in
+        // `apply_abi_annotations`. Argument sets never consult `*_rets`.
+        for (position, &reg) in argsel.iter().enumerate() {
+            // FP-lane registers have no `reg_ids` entry; their kind is
+            // already fixed above, and their spelling came from the
+            // ordered declaration walk.
+            let Some(table) = reg_ids
+                .iter()
+                .position(|&r| index(r).is_some_and(|p| p == reg))
+            else {
+                continue;
+            };
+            let lane = reg_ids[table];
+            if abi.explicit_bool_args.contains(&lane) {
+                arg_kinds[position] = KIND_BOOL;
+            } else if abi.explicit_ptr_args.contains(&lane) && arg_kinds[position] == KIND_I64 {
+                arg_kinds[position] = KIND_PTR;
+            } else if arg_kinds[position] == KIND_I64 {
+                match abi.explicit_narrow_args.get(&lane) {
+                    Some(8) => arg_kinds[position] = KIND_I8,
+                    Some(16) => arg_kinds[position] = KIND_I16,
+                    _ => {
+                        // Declared 32-bit lanes narrow the register word
+                        // bit-exactly (LLP64 `long` keeps i32 transport).
+                        let is_declared_32 = arg_spellings[position] == "int32_t"
+                            || arg_spellings[position] == "uint32_t";
+                        if is_declared_32 {
+                            arg_kinds[position] = KIND_I32;
+                        }
+                    }
+                }
             }
         }
         let mut retsel = if cfg.functions[&e].returns {
@@ -736,6 +907,33 @@ pub fn prepare_c<'ctx>(
             for &lane in &abi.fp_returns {
                 retsel.push(fp_index(lane)?);
                 ret_kinds.push(kind(lane, &abi.fp_ret_types));
+            }
+            // Result sets never consult `*_args` (AAPCS64 `x0` split).
+            for (position, &reg) in retsel.iter().enumerate() {
+                let Some(table) = reg_ids
+                    .iter()
+                    .position(|&r| index(r).is_some_and(|p| p == reg))
+                else {
+                    continue;
+                };
+                let lane = reg_ids[table];
+                if abi.explicit_bool_rets.contains(&lane) {
+                    ret_kinds[position] = KIND_BOOL;
+                } else if abi.explicit_ptr_rets.contains(&lane) && ret_kinds[position] == KIND_I64 {
+                    ret_kinds[position] = KIND_PTR;
+                } else if ret_kinds[position] == KIND_I64 {
+                    match abi.explicit_narrow_rets.get(&lane) {
+                        Some(8) => ret_kinds[position] = KIND_I8,
+                        Some(16) => ret_kinds[position] = KIND_I16,
+                        _ => {
+                            let is_declared_32 = abi.explicit_return_spelling == "int32_t"
+                                || abi.explicit_return_spelling == "uint32_t";
+                            if is_declared_32 {
+                                ret_kinds[position] = KIND_I32;
+                            }
+                        }
+                    }
+                }
             }
         }
         let sret_reg = spec
@@ -762,6 +960,7 @@ pub fn prepare_c<'ctx>(
                     sret_param = argsel.len() as u32;
                     argsel.push(sret_reg);
                     arg_kinds.push(KIND_SRET);
+                    arg_spellings.push(String::new());
                 }
                 retsel.clear();
                 ret_kinds.clear();
@@ -769,16 +968,59 @@ pub fn prepare_c<'ctx>(
             }
             _ => {}
         }
+        // Stack formals: recovered offsets plus declared spills, sorted.
+        // Declared stack spellings align positionally with `stack` via the
+        // `explicit_order_*` stack entries and `explicit_stack_*` maps.
+        let mut stack: Vec<i64> = abi.stack_args.iter().copied().collect();
+        stack.sort();
+        stack.dedup();
+        let mut stack_kinds: Vec<u32> = vec![KIND_I64; stack.len()];
+        let mut stack_spellings: Vec<String> = vec![String::new(); stack.len()];
+        // Index declared stack formals by offset for spelling lookup.
+        let declared_stack: BTreeMap<i64, &str> = abi
+            .explicit_order_lanes
+            .iter()
+            .zip(&abi.explicit_order_stack)
+            .zip(&abi.explicit_order_spellings)
+            .filter(|((lane, _), _)| **lane == u32::MAX)
+            .map(|((_, off), spelling)| (*off, spelling.as_str()))
+            .collect();
+        for (i, off) in stack.iter().enumerate() {
+            if abi.explicit_stack_bool.contains(off) {
+                stack_kinds[i] = KIND_BOOL;
+            } else if let Some(w) = abi.explicit_stack_narrow.get(off) {
+                match w {
+                    8 => stack_kinds[i] = KIND_I8,
+                    16 => stack_kinds[i] = KIND_I16,
+                    32 => stack_kinds[i] = KIND_I32,
+                    _ => {}
+                }
+            }
+            if let Some(spelling) = declared_stack.get(off) {
+                stack_spellings[i] = (*spelling).to_owned();
+            }
+        }
+        // Full formal spelling vector: register formals then stack formals.
+        // Full kind vector likewise: register kinds then stack kinds, so
+        // the native side lowers stack formals to their declared scalar
+        // types (not always `i64`).
+        let mut full_spellings = arg_spellings;
+        full_spellings.extend(stack_spellings);
+        let mut full_kinds = arg_kinds;
+        full_kinds.extend(stack_kinds.iter().copied());
         owned.push(Owned {
             args: argsel,
-            stack: abi.stack_args.iter().copied().collect(),
+            stack,
             rets: retsel,
             balanced: abi.analysis.converged && abi.frame.balanced,
             preserved: kept,
-            arg_kinds,
+            arg_kinds: full_kinds,
+            stack_kinds,
             ret_kinds,
             ret_class,
             sret_param,
+            arg_spellings: full_spellings,
+            ret_spelling: abi.explicit_return_spelling.clone(),
         });
         entries.push((e, abi.frame.size));
     }
@@ -852,6 +1094,12 @@ pub fn prepare_c<'ctx>(
                 };
                 let callee = callee.get_name().to_str().unwrap_or_default().to_owned();
                 let raw = inst.as_value_ref().cast();
+                // Analysis-only return boundaries never reach the C: drop them
+                // here so role lookup never sees a marker callee.
+                if callee == crate::calls::RETURN_MARKER {
+                    inst.erase_from_basic_block();
+                    continue;
+                }
                 if callee == SYSCALL {
                     raw_calls.push((raw, CALL_SYSCALL, None, 0, u32::MAX));
                     continue;
@@ -1027,6 +1275,76 @@ pub fn prepare_c<'ctx>(
     module
         .verify()
         .map_err(|e| Error::Llvm(format!("ABI form: {e}")))?;
+    // Declared C spellings attach AFTER the native ABI form rewrote the
+    // functions: per-parameter `biara.c_type` on each ABI-form formal and
+    // function `biara.c_return` for the return. String attributes (not
+    // metadata: the function-pass pipeline preserves attributes through
+    // simplification, and the summary/native renderer read them back).
+    // Only actual ABI-form formals carry them: implicit env/CPU state
+    // never takes a declared type, and stack slots are formals too.
+    // `entries`/`owned` (the pre-ABI-form vectors) align positionally;
+    // names resolve through the ABI-form module below.
+    {
+        use inkwell::attributes::AttributeLoc;
+        for ((entry, _), o) in entries.iter().zip(&owned) {
+            let Some(func_name) = name_of(*entry).or_else(|| names.get(entry).cloned()) else {
+                continue;
+            };
+            let Some(func) = module.get_function(&func_name) else {
+                continue;
+            };
+            if func.count_basic_blocks() == 0 {
+                continue;
+            }
+            for (i, spelling) in o.arg_spellings.iter().enumerate() {
+                if spelling.is_empty() {
+                    continue;
+                }
+                if i >= func.count_params() as usize {
+                    break;
+                }
+                func.add_attribute(
+                    AttributeLoc::Param(i as u32),
+                    cx.create_string_attribute(crate::signatures::DECLARED_PARAM_ATTR, spelling),
+                );
+            }
+            if !o.ret_spelling.is_empty() {
+                func.add_attribute(
+                    AttributeLoc::Function,
+                    cx.create_string_attribute(
+                        crate::signatures::DECLARED_RETURN_ATTR,
+                        &o.ret_spelling,
+                    ),
+                );
+            }
+        }
+    }
+    // Callees that are declarations (outside the selection, or PLT stubs) keep their guest
+    // address in `!biara.callee`, never `!biara.entry`: carriers of that are emitted as
+    // definitions, but the renderer's symbol table still needs the address so a client can
+    // navigate from a call to its target.
+    let callees: Vec<(u64, String)> = names
+        .iter()
+        .filter(|(_, name)| {
+            module
+                .get_function(name)
+                .is_some_and(|f| f.count_basic_blocks() == 0)
+        })
+        .map(|(&entry, name)| (entry, name.clone()))
+        .collect();
+    for (entry, name) in &callees {
+        module
+            .get_function(name)
+            .unwrap()
+            .as_global_value()
+            .set_metadata(
+                cx.metadata_node(&[
+                    cx.i64_type().const_int(*entry, false).into(),
+                    cx.i32_type().const_int(1, false).into(),
+                ]),
+                cx.get_kind_id("biara.callee"),
+            );
+    }
     // Tag actual ABI-form guest identities, before display sanitization and
     // scalar passes. Generated dispatchers and import declarations stay untagged.
     let entries: BTreeMap<_, _> = names
@@ -1119,7 +1437,102 @@ pub fn prepare_c<'ctx>(
     })
 }
 
+/// Lift every function of `cfg` and put it in ABI form. The returned
+/// stage owns its module and compact summaries only; drop `cfg`, `abis`,
+/// and the libtcg guard before the expensive `transform`/`render`.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_c<'ctx>(
+    cx: &'ctx Context,
+    machine: &TargetMachine,
+    info: &ContextInfo,
+    cfg: &Cfg,
+    abis: &BTreeMap<u64, FunctionAbi>,
+    name_of: &dyn Fn(u64) -> Option<String>,
+    banner: &str,
+    data: &BTreeMap<u64, (String, u64)>,
+) -> Result<PreparedC<'ctx>, Error> {
+    prepare_c_with(cx, machine, info, cfg, abis, name_of, banner, data, None)
+}
+
+/// Lower only `selection` (plus directly referenced callees/stubs, as
+/// declarations with recovered signatures) before/after the shared ABI
+/// lowering. Unknown addresses resolve nowhere and are skipped; a
+/// full-CFG selection lowers identically to [`prepare_c`].
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_c_selected<'ctx>(
+    cx: &'ctx Context,
+    machine: &TargetMachine,
+    info: &ContextInfo,
+    cfg: &Cfg,
+    abis: &BTreeMap<u64, FunctionAbi>,
+    name_of: &dyn Fn(u64) -> Option<String>,
+    banner: &str,
+    data: &BTreeMap<u64, (String, u64)>,
+    selection: &BTreeSet<u64>,
+) -> Result<PreparedC<'ctx>, Error> {
+    if selection.iter().all(|e| cfg.functions.contains_key(e))
+        && selection.len() == cfg.functions.len()
+    {
+        return prepare_c_with(cx, machine, info, cfg, abis, name_of, banner, data, None);
+    }
+    let view = crate::resolution_view(cfg, selection);
+    let view_abis: BTreeMap<u64, FunctionAbi> = view
+        .functions
+        .keys()
+        .filter_map(|e| abis.get(e).map(|abi| (*e, abi.clone())))
+        .collect();
+    let view_data: BTreeMap<u64, (String, u64)> = view
+        .functions
+        .keys()
+        .filter_map(|e| data.get(e).map(|d| (*e, d.clone())))
+        .collect();
+    // Bodies land only for view functions that have blocks (the selection
+    // plus stubs); referenced callees stay declarations for signatures and
+    // dispatch. Lifting a body-less function panics on its missing entry,
+    // so unknown selection addresses resolve nowhere and are skipped
+    // rather than failing the whole job. Callee declarations without
+    // recovered ABI entries keep their IR default (raw-word) signature:
+    // `prepare_c_with` only assigns recovered signatures to ABI-known
+    // entries, and unknown callees/imports already lower through the
+    // convention's unknown-call shape at call sites.
+    let known: BTreeSet<u64> = view
+        .functions
+        .iter()
+        .filter(|(_, f)| !f.blocks.is_empty())
+        .map(|(e, _)| *e)
+        .collect();
+    prepare_c_with(
+        cx,
+        machine,
+        info,
+        &view,
+        &view_abis,
+        name_of,
+        banner,
+        &view_data,
+        Some(crate::Analysis {
+            only: &known,
+            target_markers: false,
+        }),
+    )
+}
 impl<'ctx> PreparedC<'ctx> {
+    /// Apply annotation names already supported by the renderer: rename
+    /// each annotated LLVM function to its unique display name (deduped
+    /// exactly as `name_of` was at prepare time) and refresh the `entries`
+    /// /`fns` summaries. Explicit signatures need no work here: they
+    /// already adjusted the ABI map before lifting. Global and struct
+    /// display names apply at the transformed stage (data table and
+    /// layout renames), where the renderer consumes them.
+    pub fn apply_annotations(&mut self, annotations: &Annotations) -> Result<(), Error> {
+        apply_renames(
+            &self.module,
+            &mut self.summaries.entries,
+            &mut self.summaries.fns,
+            annotations,
+        )
+    }
+
     /// Simplify the ABI form and recover guest strings/prototypes.
     /// `read` only needs constant guest memory; the image may be
     /// released once this returns.
@@ -1187,6 +1600,7 @@ impl<'ctx> PreparedC<'ctx> {
                 .map(|(addr, text)| (addr, text.into_string().unwrap_or_default()))
                 .collect(),
             protos,
+            structs: BTreeMap::new(),
         })
     }
 }
@@ -1231,9 +1645,46 @@ unsafe extern "C" fn package_cb(ctx: *mut c_void, p: *const c_char, n: usize) ->
         return 1;
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let package =
+        let mut package: FunctionPackage =
             serde_json::from_slice(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) })
                 .map_err(std::io::Error::other)?;
+        // Authoritative native table rides on the record (`symbols`):
+        // build the lexer's table from it, falling back to the legacy
+        // display-text tables only for records predating native emission.
+        // Hostile spans (out-of-range/overlapping) surface as consumer
+        // errors, never panics: `package_cb` returns nonzero and the
+        // error reaches `visit_functions` as `Error::Io`.
+        let table: Vec<crate::tokens::LexSymbol> = match &package.symbols {
+            Some(native) => {
+                let mut table = Vec::with_capacity(
+                    native.functions.len() + native.globals.len() + native.types.len(),
+                );
+                for f in &native.functions {
+                    table.push(crate::tokens::LexSymbol {
+                        text: f.text.clone(),
+                        symbol: biara_proto::tokens::SymbolRef::Function { address: f.address },
+                    });
+                }
+                for g in &native.globals {
+                    table.push(crate::tokens::LexSymbol {
+                        text: g.text.clone(),
+                        symbol: biara_proto::tokens::SymbolRef::Global { address: g.address },
+                    });
+                }
+                for t in &native.types {
+                    table.push(crate::tokens::LexSymbol {
+                        text: t.text.clone(),
+                        symbol: biara_proto::tokens::SymbolRef::Type {
+                            layout: t.layout,
+                            function: package.address,
+                        },
+                    });
+                }
+                table
+            }
+            None => fallback_symbols(&package),
+        };
+        package.tokens = crate::tokens::lex(&package.body, &package.signature, &table);
         (state.consumer)(package)
     }));
     match result {
@@ -1249,21 +1700,191 @@ unsafe extern "C" fn package_cb(ctx: *mut c_void, p: *const c_char, n: usize) ->
     }
 }
 
+/// Legacy display-text symbol table for records predating native `symbols`
+/// emission: sanitized function/global spellings plus layout short names.
+/// Cannot distinguish shadowed locals (no authoritative scope); kept only
+/// so old records still lex. New records always carry `symbols` and never
+/// use this path.
+fn fallback_symbols(package: &FunctionPackage) -> Vec<crate::tokens::LexSymbol> {
+    let mut symbols = Vec::new();
+    for dep in &package.dependencies {
+        let (kind, text) = (dep.kind.as_str(), dep.id.as_str());
+        let short = text.rsplit(':').next().unwrap_or(text);
+        if kind == "function" {
+            symbols.push(crate::tokens::LexSymbol {
+                text: short.to_owned(),
+                symbol: biara_proto::tokens::SymbolRef::Function {
+                    address: package.address,
+                },
+            });
+        } else if kind == "global" {
+            symbols.push(crate::tokens::LexSymbol {
+                text: short.to_owned(),
+                symbol: biara_proto::tokens::SymbolRef::Global {
+                    address: package.address,
+                },
+            });
+        } else if kind == "type" {
+            symbols.push(crate::tokens::LexSymbol {
+                text: short.to_owned(),
+                symbol: biara_proto::tokens::SymbolRef::Type {
+                    layout: 0,
+                    function: package.address,
+                },
+            });
+        }
+    }
+    symbols
+}
+
+/// The register a DWARF register number names in the TCG context, for the architectures the
+/// lifter supports.
+fn debug_register(arch: &str, reg: u16) -> Option<String> {
+    match arch {
+        "x86_64" => [
+            "rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11",
+            "r12", "r13", "r14", "r15",
+        ]
+        .get(reg as usize)
+        .map(|s| s.to_string()),
+        "aarch64" if reg < 31 => Some(format!("x{reg}")),
+        _ => None,
+    }
+}
+
 impl<'ctx> TransformedC<'ctx> {
+    /// Name parameters and stack objects from `image`'s debug information: variables that sit
+    /// in a register at function entry take their source name, and whole stack objects take
+    /// their name and declared type. Ambiguous bindings keep neutral names.
+    pub fn apply_image_debug(&mut self, image: &biara_loader::Image) {
+        let names: Vec<_> = image
+            .debug_names
+            .iter()
+            .filter_map(|n| {
+                Some(DebugName {
+                    function: n.function,
+                    register: debug_register(image.arch, n.register)?,
+                    name: n.name.clone(),
+                })
+            })
+            .collect();
+        self.apply_debug_names(&names);
+        let objects: Vec<_> = image
+            .stack_objects
+            .iter()
+            .map(|o| DebugObject {
+                function: o.function,
+                start: o.range.start,
+                end: o.range.end,
+                offset: o.offset,
+                size: o.size,
+                name: o.name.clone(),
+                type_name: o.type_name.clone(),
+            })
+            .collect();
+        self.apply_debug_objects(&objects);
+    }
+
     fn ensure_layouts(&mut self) -> Result<(), Error> {
-        if let Some(layouts) = &mut self.layouts {
-            if self.layout_debug_dirty {
-                layouts.apply_debug(&self.module)?;
-            }
-        } else {
+        if self.layouts.is_none() {
             self.layouts = Some(crate::layouts::Handle::build(
                 &self.module,
                 &self.cpu,
                 MARGIN,
             )?);
         }
+        if self.layout_debug_dirty {
+            // Split the borrows: `bind_structs` only reads `self.structs`
+            // (plus module/facts), so copy the struct declarations out
+            // before taking the mutable layouts handle.
+            let structs = self.structs.clone();
+            let layouts = self.layouts.as_mut().unwrap();
+            layouts.apply_debug(&self.module)?;
+            Self::bind_structs_inner(&self.module, &structs, layouts)?;
+        }
         self.layout_debug_dirty = false;
         Ok(())
+    }
+
+    /// Bind explicit `struct name *` lanes to their declared layouts.
+    /// Each binding names one layout class reached through a bound lane;
+    /// unrelated classes with matching shapes never change. Asserted
+    /// field types and provenance flow through the re-exported facts.
+    fn bind_structs(&self, layouts: &mut crate::layouts::Handle) -> Result<(), Error> {
+        Self::bind_structs_inner(&self.module, &self.structs, layouts)
+    }
+
+    fn bind_structs_inner(
+        module: &inkwell::module::Module<'_>,
+        structs: &std::collections::BTreeMap<String, biara_proto::annotations::StructAnnotation>,
+        layouts: &mut crate::layouts::Handle,
+    ) -> Result<(), Error> {
+        if structs.is_empty() {
+            return Ok(());
+        }
+        let facts = layouts.facts()?;
+        let signatures = crate::signatures::summarize(module, &facts)?;
+        // Declared struct lanes name their layout through the per-formal
+        // `biara.c_type` spelling (`struct Name *`), not through map
+        // iteration order: only lanes whose declared spelling names the
+        // struct bind that struct's layout. Unrelated layouts with
+        // matching shapes never change.
+        let mut referenced: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut wanted: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
+        for sig in &signatures {
+            for (index, spelling) in sig.declared_params.iter().enumerate() {
+                let Some(struct_name) = spelling
+                    .strip_prefix("struct ")
+                    .and_then(|s| s.strip_suffix(" *"))
+                    .filter(|s| !s.is_empty() && !s.contains([' ', '*']))
+                else {
+                    continue;
+                };
+                if sig
+                    .params
+                    .get(index)
+                    .is_some_and(|t| matches!(t, crate::signatures::AbiTy::Ptr { .. }))
+                    && let Some(bound) = facts
+                        .args
+                        .iter()
+                        .find(|a| a.function == sig.function && a.arg == index as u32)
+                        .and_then(|a| a.layout)
+                {
+                    referenced.insert(bound);
+                    wanted.insert(bound, struct_name.to_owned());
+                }
+            }
+        }
+        let mut binds: Vec<(String, biara_proto::annotations::StructAnnotation)> = Vec::new();
+        for (name, decl) in structs {
+            // Only bind structs a declared lane actually names; a struct
+            // whose layout no named lane reaches leaves output unchanged.
+            if !wanted.values().any(|w| w == name) {
+                continue;
+            }
+            let mut used = false;
+            for id in &referenced {
+                if wanted.get(id).is_some_and(|w| w != name) {
+                    continue;
+                }
+                let Some(layout) = facts.layouts.iter().find(|l| l.id == *id) else {
+                    continue;
+                };
+                let covers = layout.fields.iter().all(|f| {
+                    decl.fields
+                        .iter()
+                        .any(|d| d.offset == f.off && d.bytes == f.bytes)
+                });
+                if covers && !layout.fields.is_empty() {
+                    used = true;
+                    break;
+                }
+            }
+            if used {
+                binds.push((name.clone(), decl.clone()));
+            }
+        }
+        layouts.bind_by_name(&binds, &referenced)
     }
 
     /// Reusable observed layout evidence. Sizes describe accessed bytes, not
@@ -1283,14 +1904,28 @@ impl<'ctx> TransformedC<'ctx> {
             signatures,
         })
     }
-
     /// Visit independent guest-function records in deterministic presentation
     /// order. One function is buffered; callback errors/panics stop immediately.
     /// The caller owns any sink flushing (unlike `render`, this is not a sink).
+    /// Each record also carries a lexical [`biara_proto::tokens::Token`]
+    /// stream over its body plus the authoritative native `symbols` table
+    /// the lexer resolved against: byte offsets plus optional semantic
+    /// symbol references (functions/globals by address, types by layout id
+    /// scoped to the referencing function record). Identity derives from
+    /// real LLVM/native entities at emission, never lexical guesses:
+    /// declarations, plain global loads, address uses, calls/function
+    /// values, casts and type uses all attribute; member-field sides,
+    /// locals, parameters, keywords, numbers, comments and string contents
+    /// never do. Locals were suffixed against the table at emission, so a
+    /// rename substitution touches only genuine symbols.
     pub fn visit_functions(
         mut self,
         consumer: &mut dyn FnMut(FunctionPackage) -> std::io::Result<()>,
     ) -> Result<CStats, Error> {
+        // Ensure layouts (renames already applied) so the native table the
+        // renderer emits carries final spellings; tokens resolve in
+        // `package_cb` against each record's own `symbols` table.
+        self.layout_facts()?;
         let mut state = PackageState {
             consumer,
             err: None,
@@ -1304,6 +1939,21 @@ impl<'ctx> TransformedC<'ctx> {
             return Err(Error::Io(e));
         }
         result
+    }
+
+    /// Apply annotation display names: function renames (same contract as
+    /// [`PreparedC::apply_annotations`]), global renames over the data
+    /// table, and struct display renames over the cached layout analysis.
+    /// Layout ids, sizes, offsets and bindings never move; struct
+    /// declarations that cover no recovered layout leave output unchanged.
+    pub fn apply_annotations(&mut self, annotations: &Annotations) -> Result<(), Error> {
+        self.layout_debug_dirty = self.layout_debug_dirty
+            || !annotations.functions.is_empty()
+            || !annotations.structs.is_empty();
+        apply_renames(&self.module, &mut self.entries, &mut self.fns, annotations)?;
+        apply_global_renames(&mut self.data, annotations)?;
+        self.structs = annotations.structs.clone();
+        Ok(())
     }
 
     /// Select analysis bodies only, in the supplied root/context order.
@@ -1543,6 +2193,115 @@ impl<'ctx> TransformedC<'ctx> {
     }
 }
 
+/// Rename annotated LLVM functions and refresh the `entries`/`fns`
+/// summaries. Names dedupe against the unannotated display names exactly as
+/// `prepare_c` does (`{name}_{entry:x}` on collision); direct calls
+/// reference the renamed `FunctionValue`, so they follow automatically.
+/// Explicit signatures need no work here: they already adjusted the ABI
+/// map in `apply_abi_annotations` before lifting, so the module below
+/// already carries the declared lane types.
+fn apply_renames(
+    module: &Module<'_>,
+    entries: &mut BTreeMap<u64, String>,
+    fns: &mut [(u64, String)],
+    annotations: &Annotations,
+) -> Result<(), Error> {
+    annotations
+        .validate()
+        .map_err(|e| Error::Llvm(e.to_string()))?;
+    let new_names: BTreeMap<u64, String> = annotations.functions.iter().try_fold(
+        BTreeMap::new(),
+        |mut acc: BTreeMap<u64, String>, (&address, function)| {
+            if let (Some(name), Some(_)) = (function.name.as_deref(), entries.get(&address)) {
+                if name.is_empty() {
+                    return Err(Error::Llvm(format!(
+                        "empty annotation name for {address:#x}"
+                    )));
+                }
+                acc.insert(address, name.to_owned());
+            }
+            Ok::<_, Error>(acc)
+        },
+    )?;
+    if new_names.is_empty() {
+        return Ok(());
+    }
+    // Names currently taken by functions we are not renaming.
+    let mut taken: BTreeSet<String> = entries
+        .iter()
+        .filter(|(address, _)| !new_names.contains_key(address))
+        .map(|(_, name)| name.clone())
+        .collect();
+    let mut fresh: BTreeMap<u64, String> = BTreeMap::new();
+    for (&address, wanted) in &new_names {
+        let mut candidate = wanted.clone();
+        if taken.contains(&candidate) {
+            candidate = format!("{wanted}_{address:x}");
+        }
+        // Successive annotations wanting the same name collide too.
+        while taken.contains(&candidate) {
+            candidate = format!("{candidate}_{address:x}");
+        }
+        taken.insert(candidate.clone());
+        fresh.insert(address, candidate);
+    }
+    for (&address, name) in &fresh {
+        let old = entries.get(&address).cloned().unwrap_or_default();
+        if old == *name {
+            continue;
+        }
+        let Some(function) = module.get_function(&old) else {
+            continue;
+        };
+        function.as_global_value().set_name(name);
+        entries.insert(address, name.clone());
+        if let Some(slot) = fns.iter_mut().find(|(entry, _)| *entry == address) {
+            slot.1 = name.clone();
+        }
+    }
+    Ok(())
+}
+
+/// Rename annotated copied-data globals and refresh the `data` summary.
+/// Names dedupe against unannotated display names; unknown addresses are
+/// ignored (they resolve nowhere). The renderer prints `data` names
+/// through `ident()`, so sanitization stays in one place.
+fn apply_global_renames(
+    data: &mut [(u64, u64, String)],
+    annotations: &Annotations,
+) -> Result<(), Error> {
+    if annotations.globals.is_empty() {
+        return Ok(());
+    }
+    annotations
+        .validate()
+        .map_err(|e| Error::Llvm(e.to_string()))?;
+    let mut taken: BTreeSet<String> = data
+        .iter()
+        .filter(|(address, _, _)| !annotations.globals.contains_key(address))
+        .map(|(_, _, name)| name.clone())
+        .collect();
+    for (address, name) in &annotations.globals {
+        let Some(slot) = data.iter_mut().find(|(entry, _, _)| entry == address) else {
+            continue;
+        };
+        if slot.2 == *name {
+            taken.insert(name.clone());
+            continue;
+        }
+        let mut candidate = name.clone();
+        if taken.contains(&candidate) {
+            candidate = format!("{name}_{address:x}");
+        }
+        while taken.contains(&candidate) {
+            candidate = format!("{candidate}_{address:x}");
+        }
+        taken.insert(candidate.clone());
+        slot.2 = candidate;
+    }
+    Ok(())
+}
+
 unsafe extern "C" {
     #[link_name = "free"]
     fn libc_free(p: *mut c_void);
@@ -1648,6 +2407,7 @@ mod tests {
             entries: BTreeMap::new(),
             strings: Vec::new(),
             protos: Vec::new(),
+            structs: BTreeMap::new(),
         };
         // This small output fits in BufWriter. The underlying write only
         // fails when render flushes, not during the native callbacks.
@@ -1694,6 +2454,7 @@ mod tests {
             entries,
             strings: Vec::new(),
             protos: Vec::new(),
+            structs: BTreeMap::new(),
         }
     }
 
@@ -1930,7 +2691,7 @@ mod tests {
     fn failed_function_round_can_be_followed_by_a_successful_round() {
         let cx = Context::create();
         let transformed = package_module(&cx);
-        let machine = crate::host_machine().unwrap();
+        let machine = crate::analysis_machine().unwrap();
         let options = DecompileOptions::with_workers(std::num::NonZeroUsize::new(2).unwrap());
         let error = function_passes(
             &transformed.module,
@@ -1947,6 +2708,9 @@ mod tests {
             options,
         )
         .unwrap();
+        // Genuine JIT execution: a native machine, never the analysis one.
+        let native = crate::native_machine().unwrap();
+        let _ = &native;
         let engine = transformed
             .module
             .create_jit_execution_engine(inkwell::OptimizationLevel::None)
@@ -1965,7 +2729,7 @@ mod tests {
     fn failed_worker_restores_bodies_before_retry() {
         let cx = Context::create();
         let transformed = package_module(&cx);
-        let machine = crate::host_machine().unwrap();
+        let machine = crate::analysis_machine().unwrap();
         let options = DecompileOptions::with_workers(std::num::NonZeroUsize::new(2).unwrap());
         let invalid =
             transformed
@@ -2008,6 +2772,9 @@ mod tests {
             .module
             .create_jit_execution_engine(inkwell::OptimizationLevel::None)
             .unwrap();
+        // Genuine JIT execution: a native machine, never the analysis one.
+        let native = crate::native_machine().unwrap();
+        let _ = &native;
         for (name, expected) in [("first", 0x1000), ("second", 0x2000), ("invalid", 42)] {
             let function = unsafe {
                 engine
@@ -2017,7 +2784,179 @@ mod tests {
             assert_eq!(unsafe { function.call() }, expected);
         }
     }
+    #[test]
+    fn tokens_attribute_authoritative_hits_not_locals_or_literals() {
+        use crate::tokens::{LexSymbol, c_ident, lex};
+        use biara_proto::tokens::{SymbolRef, substitute};
+        // The renderer uniquifies locals against the table at emission,
+        // so the local below is `helper_1`, not `helper`: every `helper`
+        // hit is a genuine symbol (declaration, address use, call,
+        // plain value use all attribute). Comments and string literals
+        // never do, even when their text matches.
+        let body = "\nuint64_t my_caller(uint64_t arg0)\n{\n    uint64_t helper_1 = arg0 + 1;\n    /* call helper(1) for help */\n    uint64_t v0 = helper(\"helper\");\n    return helper(v0) + helper_1;\n}\n";
+        let symbols = vec![LexSymbol {
+            text: c_ident("helper"),
+            symbol: SymbolRef::Function { address: 0x2000 },
+        }];
+        let tokens = lex(body, "uint64_t my_caller(uint64_t arg0)", &symbols);
+        let refs: Vec<_> = tokens.iter().filter(|t| t.symbol.is_some()).collect();
+        assert_eq!(refs.len(), 2, "both code hits attribute: {tokens:?}");
+        for r in &refs {
+            assert_eq!(&body[r.start as usize..r.end as usize], "helper");
+            assert_eq!(r.symbol, Some(SymbolRef::Function { address: 0x2000 }));
+        }
+        let renames = BTreeMap::from([(
+            SymbolRef::Function { address: 0x2000 },
+            "renamed".to_owned(),
+        )]);
+        let renamed = substitute(body, &tokens, &renames).unwrap();
+        assert!(
+            renamed.contains("return renamed(v0) + helper_1;"),
+            "{renamed}"
+        );
+        assert!(
+            renamed.contains("uint64_t helper_1 = arg0 + 1;"),
+            "{renamed}"
+        );
+        assert!(
+            renamed.contains("/* call helper(1) for help */"),
+            "{renamed}"
+        );
+        // Hostile token streams are errors, never panics.
+        let mut shifted = tokens.clone();
+        let hit = shifted.iter_mut().find(|t| t.symbol.is_some()).unwrap();
+        hit.start += 1;
+        assert!(substitute(body, &shifted, &renames).is_err());
+        let mut overlap = tokens.clone();
+        let first = overlap.iter().find(|t| t.symbol.is_some()).unwrap().clone();
+        overlap.push(first);
+        assert!(substitute(body, &overlap, &renames).is_err());
+    }
+    #[test]
+    fn tokens_attribute_globals_and_types_with_scope() {
+        use crate::tokens::{LexSymbol, c_ident, lex};
+        use biara_proto::tokens::SymbolRef;
+        let body = "\nuint64_t my_fn(uint64_t x)\n{\n    struct s1 a = my_global + my_fn(1);\n    struct s1 *b = &my_global;\n    my_global = x;\n    return (uint64_t)b;\n}\n";
+        let symbols = vec![
+            LexSymbol {
+                text: c_ident("my_global"),
+                symbol: SymbolRef::Global { address: 0x5000 },
+            },
+            LexSymbol {
+                text: "s1".into(),
+                symbol: SymbolRef::Type {
+                    layout: 3,
+                    function: 0x4000,
+                },
+            },
+            LexSymbol {
+                text: c_ident("my_fn"),
+                symbol: SymbolRef::Function { address: 0x4000 },
+            },
+        ];
+        let tokens = lex(body, "struct s1 *my_fn(uint64_t x)", &symbols);
+        // Plain loads (`my_global` as a value), address uses (`&`), and
+        // stores all attribute: no plain-value shortcut.
+        let globals: Vec<_> = tokens
+            .iter()
+            .filter(|t| matches!(t.symbol, Some(SymbolRef::Global { .. })))
+            .collect();
+        assert!(globals.len() >= 3, "{tokens:?}");
+        assert!(
+            globals
+                .iter()
+                .all(|t| &body[t.start as usize..t.end as usize] == "my_global")
+        );
+        // Type hits carry the referencing function scope explicitly.
+        let types: Vec<_> = tokens
+            .iter()
+            .filter(|t| matches!(t.symbol, Some(SymbolRef::Type { .. })))
+            .collect();
+        assert_eq!(types.len(), 2, "{tokens:?}");
+    }
 
+    #[test]
+    fn tokens_never_attribute_members_comments_or_strings() {
+        use crate::tokens::{LexSymbol, c_ident, lex};
+        use biara_proto::tokens::SymbolRef;
+        // `count` is a member field (after `.`/`->`), never a global,
+        // even though a global spells the same. Comments and strings
+        // never attribute either.
+        let body = "\nuint64_t my_fn(uint64_t x)\n{\n    uint64_t v = p.count + q->count;\n    /* count my_global */\n    return v + \"count\"[0];\n}\n";
+        let symbols = vec![
+            LexSymbol {
+                text: "count".into(),
+                symbol: SymbolRef::Global { address: 0x6000 },
+            },
+            LexSymbol {
+                text: c_ident("my_global"),
+                symbol: SymbolRef::Global { address: 0x5000 },
+            },
+            LexSymbol {
+                text: c_ident("my_fn"),
+                symbol: SymbolRef::Function { address: 0x4000 },
+            },
+        ];
+        let tokens = lex(body, "uint64_t my_fn(uint64_t x)", &symbols);
+        for t in &tokens {
+            let text = &body[t.start as usize..t.end as usize];
+            if text == "count" && t.symbol.is_some() {
+                // Only non-member positions may attribute; member sides
+                // must not.
+                let idx = tokens.iter().position(|u| u.start == t.start).unwrap();
+                let prev = tokens[..idx]
+                    .iter()
+                    .rfind(|u| u.kind != "whitespace" && u.kind != "comment");
+                let prev_text = prev
+                    .map(|u| &body[u.start as usize..u.end as usize])
+                    .unwrap_or("");
+                assert!(
+                    prev_text != "." && prev_text != "->",
+                    "member side attributed: {tokens:?}"
+                );
+            }
+        }
+        // The comment and string literal mentions stay unattributed: only
+        // code identifiers can carry symbols, and these are masked.
+        let code_refs: Vec<_> = tokens.iter().filter(|t| t.symbol.is_some()).collect();
+        assert!(code_refs.iter().all(|t| {
+            let idx = tokens.iter().position(|u| u.start == t.start).unwrap();
+            tokens[idx].kind == "identifier"
+        }));
+    }
+
+    #[test]
+    fn substitute_keys_by_symbol_not_address() {
+        use biara_proto::tokens::{SymbolRef, Token, substitute};
+        // A function address and a global image address that are
+        // numerically equal are distinct rename keys: no raw-u64
+        // collision.
+        let body = "aa bb";
+        let tokens = vec![
+            Token {
+                start: 0,
+                end: 2,
+                kind: "identifier".into(),
+                symbol: Some(SymbolRef::Function { address: 42 }),
+            },
+            Token {
+                start: 2,
+                end: 3,
+                kind: "whitespace".into(),
+                symbol: None,
+            },
+            Token {
+                start: 3,
+                end: 5,
+                kind: "identifier".into(),
+                symbol: Some(SymbolRef::Global { address: 42 }),
+            },
+        ];
+        let renames = BTreeMap::from([(SymbolRef::Function { address: 42 }, "ff".to_owned())]);
+        assert_eq!(substitute(body, &tokens, &renames).unwrap(), "ff bb");
+        let renames = BTreeMap::from([(SymbolRef::Global { address: 42 }, "gg".to_owned())]);
+        assert_eq!(substitute(body, &tokens, &renames).unwrap(), "aa gg");
+    }
     #[test]
     fn grouped_round_preserves_private_calls_and_shared_global_state() {
         let cx = Context::create();
@@ -2057,7 +2996,7 @@ mod tests {
             "shared-state",
         );
         let module = cx.create_module_from_ir(buffer).unwrap();
-        let machine = crate::host_machine().unwrap();
+        let machine = crate::native_machine().unwrap();
         function_passes(
             &module,
             &machine,

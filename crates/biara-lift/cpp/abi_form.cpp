@@ -61,7 +61,11 @@ enum {
   BIARA_KIND_PTR = 5,
   BIARA_KIND_SRET = 6,
   BIARA_KIND_RAW = 7,
-  BIARA_KIND_CONFLICT = 8
+  BIARA_KIND_CONFLICT = 8,
+  BIARA_KIND_I8 = 9,
+  BIARA_KIND_I16 = 10,
+  BIARA_KIND_BOOL = 11,
+  BIARA_KIND_I32DECL = 12
 };
 
 // How a return value travels: direct value, two-element aggregate, or
@@ -87,8 +91,10 @@ struct BiaraSig {
   const uint32_t *preserved; // registers kept, in the analysis's order
   uint32_t npreserved;
   // Per-parameter ABI kinds (`BIARA_KIND_*`, length `nargs + nstack`;
-  // stack slots are always `BIARA_KIND_I64`). Null means all-integer
-  // (the previous raw-word behavior).
+  // stack slots carry their declared scalar kind: `I64` by default,
+  // `I8`/`I16`/`I32DECL`/`BOOL` for declared narrow/boolean spilled
+  // scalars, coerced bit-exactly at the slot boundary). Null means
+  // all-integer (the previous raw-word behavior).
   const uint32_t *arg_kinds;
   // Per-result ABI kinds (`BIARA_KIND_*`, length `nrets`; null means
   // all-integer). A single `F32`/`F64`/`VEC128` result is that LLVM type;
@@ -180,7 +186,11 @@ struct Former {
       for (uint32_t A = 0; A < S.nstack; ++A) {
         Value *Sp = readCpu(CallB, Cv.sp, i64());
         Value *Address = CallB.CreateAdd(Sp, CallB.getInt64(S.stack_args[A]));
-        Args.push_back(CallB.CreateLoad(i64(), CallB.CreateIntToPtr(Address, CallB.getPtrTy())));
+        Value *V = CallB.CreateLoad(i64(), CallB.CreateIntToPtr(Address, CallB.getPtrTy()));
+        Type *Want = Fn->getFunctionType()->getParamType(S.nargs + A);
+        if (Want->isIntegerTy() && Want->getIntegerBitWidth() < 64)
+          V = CallB.CreateTrunc(V, Want);
+        Args.push_back(V);
       }
       Value *Result = CallB.CreateCall(Fn, Args);
       for (uint32_t R = 0; R < S.nrets; ++R)
@@ -200,11 +210,21 @@ struct Former {
   Type *f64() { return Type::getDoubleTy(Cx); }
   Type *vec128() { return FixedVectorType::get(Type::getFloatTy(Cx), 4); }
 
-  // Native LLVM type of ABI slot `kind` over register `R`: float/double/
-  // vector spell the IR directly; pointers stay pointers (never fp
-  // bitcasts); raw/conflict/integer slots stay the register integer type.
+  // Native LLVM type of ABI slot `kind` over register `R`: bool/i8/i16/
+  // i32-declared/float/double/vector spell the IR directly; pointers stay
+  // pointers (never fp bitcasts); raw/conflict/integer slots stay the
+  // register integer type. `readSlot`/`invoke`/`readCpu` extend narrow
+  // slots back out, so guest bits never change.
   Type *slotTy(uint32_t R, uint32_t Kind) {
     switch (Kind) {
+    case BIARA_KIND_BOOL:
+      return Type::getInt1Ty(Cx);
+    case BIARA_KIND_I8:
+      return Type::getInt8Ty(Cx);
+    case BIARA_KIND_I16:
+      return Type::getInt16Ty(Cx);
+    case BIARA_KIND_I32DECL:
+      return Type::getInt32Ty(Cx);
     case BIARA_KIND_F32:
       return f32();
     case BIARA_KIND_F64:
@@ -218,9 +238,12 @@ struct Former {
       return regTy(R);
     }
   }
-
   uint32_t argKind(const BiaraSig &S, uint32_t I) {
     return S.arg_kinds ? S.arg_kinds[I] : BIARA_KIND_I64;
+  }
+
+  uint32_t stackKind(const BiaraSig &S, uint32_t I) {
+    return S.arg_kinds ? S.arg_kinds[S.nargs + I] : BIARA_KIND_I64;
   }
 
   uint32_t retKind(const BiaraSig &S, uint32_t I) {
@@ -238,13 +261,30 @@ struct Former {
     return StructType::get(Cx, Fields);
   }
 
+  // LLVM type of stack formal `I` (declared scalar kind or `i64`).
+  Type *stackTy(const BiaraSig &S, uint32_t I) {
+    uint32_t K = S.arg_kinds ? S.arg_kinds[S.nargs + I] : BIARA_KIND_I64;
+    switch (K) {
+    case BIARA_KIND_BOOL:
+      return Type::getInt1Ty(Cx);
+    case BIARA_KIND_I8:
+      return Type::getInt8Ty(Cx);
+    case BIARA_KIND_I16:
+      return Type::getInt16Ty(Cx);
+    case BIARA_KIND_I32DECL:
+      return Type::getInt32Ty(Cx);
+    default:
+      return i64();
+    }
+  }
+
   void declare(const BiaraSig &S) {
     Function *Old = unwrap<Function>(S.fn);
     std::vector<Type *> Params;
     for (uint32_t I = 0; I < S.nargs; ++I)
       Params.push_back(slotTy(S.args[I], argKind(S, I)));
     for (uint32_t I = 0; I < S.nstack; ++I)
-      Params.push_back(i64());
+      Params.push_back(stackTy(S, I));
     auto *FTy = FunctionType::get(retTy(S), Params, false);
     std::string Name = Old->getName().str();
     Old->setName(Name + ".lifted");
@@ -257,7 +297,7 @@ struct Former {
     }
     // Preserve per-parameter/return ABI kinds through optimizer cloning:
     // `!biara.abi.args` holds one i32 kind per new-function parameter
-    // (register slots then stack slots, stack always KIND_I64),
+    // (register slots then stack slots with declared scalar kinds),
     // `!biara.abi.rets` one per result slot, `!biara.abi.ret_class` the
     // return shape scalar. The summary reads these instead of re-deriving
     // types from bitcasts. Uses the C++ MDNode API directly (the file
@@ -265,7 +305,7 @@ struct Former {
     {
       SmallVector<Metadata *, 8> Args;
       for (uint32_t I = 0; I < S.nargs + S.nstack; ++I) {
-        uint32_t K = I < S.nargs ? argKind(S, I) : BIARA_KIND_I64;
+        uint32_t K = I < S.nargs ? argKind(S, I) : stackKind(S, I - S.nargs);
         Args.push_back(ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(Cx), K)));
       }
       New->setMetadata(Cx.getMDKindID("biara.abi.args"), MDNode::get(Cx, Args));
@@ -440,6 +480,10 @@ struct Former {
   bool form(const BiaraSig &S, std::string &Err) {
     Function *Old = unwrap<Function>(S.fn);
     Function *New = NewOf[Old];
+    // A selected module carries native prototypes for known callees whose
+    // bodies belong to other jobs. Only definitions have register/frame IR.
+    if (Old->isDeclaration())
+      return true;
     EnvArg = Old->getArg(0);
     New->splice(New->end(), Old);
     BasicBlock &Entry = New->getEntryBlock();
@@ -464,9 +508,14 @@ struct Former {
     // into ours at the entry-stack-pointer-relative offsets, so guest
     // loads from those slots see the passed values. Without this the
     // slots read as undef and the optimizer folds the body away.
+    // Declared narrow/boolean stack formals (`i8`/`i16`/`i32`/`i1`)
+    // zero-extend into the 64-bit slot, bit-exactly.
     for (uint32_t I = 0; I < S.nstack; ++I) {
       Value *Addr = B.CreateAdd(SpIn, B.getInt64(S.stack_args[I]));
-      B.CreateStore(New->getArg(S.nargs + I), B.CreateIntToPtr(Addr, B.getPtrTy()));
+      Value *V = New->getArg(S.nargs + I);
+      if (V->getType()->isIntegerTy() && V->getType()->getIntegerBitWidth() < 64)
+        V = B.CreateZExt(V, i64());
+      B.CreateStore(V, B.CreateIntToPtr(Addr, B.getPtrTy()));
     }
     Promote.assign(Regs.size(), nullptr);
     for (Instruction &I : Entry) {
@@ -621,7 +670,11 @@ struct Former {
       Args.push_back(readSlot(B, Slot, T.args[I], Fn->getFunctionType()->getParamType(I)));
     for (uint32_t I = 0; I < T.nstack; ++I) {
       Value *A = B.CreateAdd(B.CreateZExtOrTrunc(Sp, i64()), B.getInt64(T.stack_args[I]));
-      Args.push_back(B.CreateLoad(i64(), B.CreateIntToPtr(A, B.getPtrTy())));
+      Value *V = B.CreateLoad(i64(), B.CreateIntToPtr(A, B.getPtrTy()));
+      Type *Want = Fn->getFunctionType()->getParamType(T.nargs + I);
+      if (Want->isIntegerTy() && Want->getIntegerBitWidth() < 64)
+        V = B.CreateTrunc(V, Want);
+      Args.push_back(V);
     }
     CallInst *R = B.CreateCall(Fn, Args);
     for (uint32_t I = 0; I < T.nrets; ++I)

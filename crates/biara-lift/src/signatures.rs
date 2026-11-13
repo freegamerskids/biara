@@ -61,10 +61,16 @@ pub enum RetClass {
 /// `SharedLayout` id (assigned there, only referenced here).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AbiTy {
+    /// 8-bit integer slot (explicit `uint8_t`/`int8_t` lane).
+    I8,
+    /// 16-bit integer slot (explicit `uint16_t`/`int16_t` lane).
+    I16,
     /// 32-bit integer slot (raw words, addresses as integers).
     I32,
     /// 64-bit integer slot (raw words, addresses as integers).
     I64,
+    /// Real boolean slot (`_Bool`): `i1` transport, declared boolean.
+    Bool,
     /// `float`: established by `Float32` lane evidence on an `f32` IR value.
     F32,
     /// `double`: established by `Float64` lane evidence on an `f64` IR value.
@@ -111,7 +117,13 @@ pub enum AbiResult {
 /// `function` is the guest entry address (`!biara.entry`); `name` is the
 /// LLVM function name. `conflicts` names parameter positions kept raw by
 /// conflicting evidence. Pointer slots reference layout ids owned by the
-/// layout analysis.
+/// layout analysis. `declared_params` carries the canonical faithful C
+/// spelling per LLVM parameter (from `biara.c_type` attributes, empty
+/// where undeclared); `declared_return` carries the canonical return
+/// spelling (from `biara.c_return`, empty where undeclared). Transport
+/// (`params`/`result`) stays sign-agnostic; declared facts preserve
+/// signedness (`int16_t` vs `uint16_t`), boolean (`_Bool`), and named
+/// struct pointers (`struct Header *`).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FuncSig {
     /// Guest entry address.
@@ -126,6 +138,14 @@ pub struct FuncSig {
     pub ret_class: RetClass,
     /// Parameter positions kept raw by conflicting evidence.
     pub conflicts: Vec<u32>,
+    /// Canonical declared C spelling per LLVM parameter, in order
+    /// (from `biara.c_type`; empty string where undeclared).
+    #[serde(default)]
+    pub declared_params: Vec<String>,
+    /// Canonical declared C return spelling (from `biara.c_return`;
+    /// empty where undeclared).
+    #[serde(default)]
+    pub declared_return: String,
 }
 
 /// Summarize every `!biara.entry`-carrying function of `module`.
@@ -204,6 +224,8 @@ pub fn summarize(
             result,
             ret_class,
             conflicts,
+            declared_params: declared_params(f),
+            declared_return: declared_return(f),
         });
     }
     Ok(out)
@@ -225,56 +247,78 @@ fn abi_metadata(
         .then_some(value)
 }
 
+// Declared-type attribute names (see annotations `CType::spelling` and
+// `prepare_c` attach): per-parameter `biara.c_type`, function
+// `biara.c_return`. Values are canonical faithful C spellings
+// (`int16_t`, `_Bool`, `struct Header *`, ...). Transport stays
+// sign-agnostic; these facts select rendering only.
+pub const DECLARED_PARAM_ATTR: &str = "biara.c_type";
+pub const DECLARED_RETURN_ATTR: &str = "biara.c_return";
+
+/// Canonical declared C spelling per LLVM parameter, in order (empty
+/// where the parameter carries no `biara.c_type` attribute).
+fn declared_params(function: inkwell::values::FunctionValue<'_>) -> Vec<String> {
+    use inkwell::attributes::AttributeLoc;
+    let n = function.count_params();
+    (0..n)
+        .map(|i| {
+            function
+                .get_string_attribute(AttributeLoc::Param(i), DECLARED_PARAM_ATTR)
+                .map(|a| a.get_string_value().to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Canonical declared C return spelling (empty where the function
+/// carries no `biara.c_return` attribute).
+fn declared_return(function: inkwell::values::FunctionValue<'_>) -> String {
+    use inkwell::attributes::AttributeLoc;
+    function
+        .get_string_attribute(AttributeLoc::Function, DECLARED_RETURN_ATTR)
+        .map(|a| a.get_string_value().to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 // These kinds describe transport evidence; no numeric cast changes the value.
+// Kinds 5/9/10/11/12 are explicit user-declared lanes (see ABI form
+// `BIARA_KIND_PTR/I8/I16/BOOL/I32`): the IR spelling is authoritative and
+// stays. `I32` marks a declared 32-bit lane whose transport is the
+// register word narrowed bit-exactly at the boundary.
 fn evidence_ty(ty: AbiTy, kind: Option<u32>) -> AbiTy {
     match kind {
+        Some(5) => AbiTy::Ptr { layout: None },
         Some(6) => AbiTy::HiddenSret,
         Some(7) => AbiTy::RawWord,
         Some(8) => AbiTy::Conflict,
+        Some(9) => AbiTy::I8,
+        Some(10) => AbiTy::I16,
+        Some(11) => AbiTy::Bool,
+        Some(12) => AbiTy::I32,
         _ => ty,
     }
 }
 
-/// ABI type of LLVM parameter `i` of `entry`: the IR type spelled directly,
-/// refined by layout bindings (pointer slots).
-///
-/// The IR is authoritative for the executable spelling: `float`/`double`/
-/// vector/pointer/integer map to their [`AbiTy`]. The ABI form only lowers
-/// a slot to float/vector when lane evidence established it, so valid
-/// typed IR summarizes directly (no guessing, and no downgrade of real
-/// float IR either way). Integer/pointer values carrying layout-bound
-/// pointers become [`AbiTy::Ptr`]; layout ids come from `layouts`
-/// argument bindings.
+/// ABI type of one LLVM parameter: the IR type spelled directly, refined
+/// by layout bindings for pointer slots. i1 spells a declared `_Bool`
+/// lane; i8/i16 spell explicit declared narrow lanes; i32/i64 are
+/// recovered integer lanes (layout-bound i64 becomes a pointer).
 fn param_ty(
     ty: AnyTypeEnum<'_>,
     entry: u64,
-    i: u32,
+    index: u32,
     layouts: &crate::layouts::LayoutFacts,
 ) -> AbiTy {
-    let layout = layout_of(layouts, entry, i);
+    let layout = layouts
+        .args
+        .iter()
+        .find(|a| a.function == entry && a.arg == index)
+        .and_then(|a| a.layout);
     match ty {
-        // Both `float` and `double` are `FloatType` in LLVM inkwell; the
-        // bit width selects the spelling. Valid typed IR is authoritative
-        // here: summarize it directly (no lane-guessing downgrade of real
-        // float IR to `RawWord`, and no bitcast guessing either way).
-        AnyTypeEnum::FloatType(t) => match t.get_bit_width() {
-            32 => AbiTy::F32,
-            64 => AbiTy::F64,
-            _ => AbiTy::RawWord,
-        },
-        AnyTypeEnum::VectorType(v) => {
-            // `<4 x float>` is the vector128 lowering; other widths stay
-            // raw words rather than guessed vectors.
-            if v.get_size() == 4
-                && matches!(v.get_element_type(), inkwell::types::BasicTypeEnum::FloatType(f) if f.get_bit_width() == 32)
-            {
-                AbiTy::Vec128
-            } else {
-                AbiTy::RawWord
-            }
-        }
-        AnyTypeEnum::PointerType(_) => AbiTy::Ptr { layout },
         AnyTypeEnum::IntType(t) => match t.get_bit_width() {
+            1 => AbiTy::Bool,
+            8 => AbiTy::I8,
+            16 => AbiTy::I16,
             32 => AbiTy::I32,
             64 => {
                 if layout.is_some() {
@@ -285,6 +329,9 @@ fn param_ty(
             }
             _ => AbiTy::RawWord,
         },
+        AnyTypeEnum::FloatType(t) if t.get_bit_width() == 32 => AbiTy::F32,
+        AnyTypeEnum::FloatType(t) if t.get_bit_width() == 64 => AbiTy::F64,
+        AnyTypeEnum::PointerType(_) => AbiTy::Ptr { layout },
         _ => AbiTy::RawWord,
     }
 }
@@ -313,8 +360,12 @@ fn result_ty(ty: inkwell::types::BasicTypeEnum<'_>) -> (AbiResult, RetClass) {
 
 /// One aggregate field's type: integers stay raw words here (pair members
 /// are register facts, not lane-typed floats); pointers keep pointer form.
+/// `i1` spells a declared `_Bool` result lane.
 fn field_ty(ty: AnyTypeEnum<'_>) -> AbiTy {
     match ty {
+        AnyTypeEnum::IntType(t) if t.get_bit_width() == 1 => AbiTy::Bool,
+        AnyTypeEnum::IntType(t) if t.get_bit_width() == 8 => AbiTy::I8,
+        AnyTypeEnum::IntType(t) if t.get_bit_width() == 16 => AbiTy::I16,
         AnyTypeEnum::IntType(t) if t.get_bit_width() == 64 => AbiTy::I64,
         AnyTypeEnum::IntType(t) if t.get_bit_width() == 32 => AbiTy::I32,
         AnyTypeEnum::PointerType(_) => AbiTy::Ptr { layout: None },

@@ -5,8 +5,9 @@
 //! QEMU state and LLVM contexts. Translation failures remain guest-analysis
 //! facts; IPC, storage and worker failures abort rather than masquerade as them.
 //!
-//! Cache identity binds binary bytes, libtcg bytes, CPU model and executable
-//! implementation. Recovery variants additionally bind entry sets and limits,
+//! Cache identity binds binary bytes, libtcg bytes, CPU model, executable
+//! implementation and the pinned analysis triple (`biara_proto::ANALYSIS_TRIPLE`).
+//! Recovery variants additionally bind entry sets and limits,
 //! never the worker count. Resolution keys contain the relevant function body
 //! and callee facts, invalidating jobs when recovery changes their dependencies.
 //! Block jobs commit as responses arrive; graph checkpoints are throttled and
@@ -19,6 +20,12 @@
 //! Resolver wire buffers are released before building LLVM IR. At job boundaries,
 //! GNU/Linux workers return large amounts of freed arena memory to the OS rather
 //! than retaining each worker's largest resolver allocation until process exit.
+//! `Options::memory_budget` partitions one Unix address-space budget across the
+//! coordinator and its worker pool: the coordinator keeps half and each worker
+//! is spawned under an inherited `RLIMIT_AS` of `remaining/workers`, so the sum
+//! of hard caps never exceeds the budget (parents only lower inherited caps).
+//! `Session::set_progress` installs an optional durable-checkpoint observer;
+//! `Session::pool_size` reports the actual spawned worker count for supervision.
 //!
 //! Schema 2 checkpoints reference project-bound immutable block artifacts.
 //! Strong Arc identities skip serialization/hashing of unchanged IR, including
@@ -76,8 +83,16 @@ pub struct Options {
     pub cpu: Option<String>,
     pub database: Option<PathBuf>,
     pub workers: usize,
+    /// Total Unix address-space budget for coordinator plus worker pool.
+    /// The coordinator keeps half; workers split the remaining half. Minimum
+    /// 2 GiB so each side has at least 1 GiB for native mappings and analysis.
+    pub memory_budget: u64,
     pub executable: PathBuf,
 }
+/// Durable-checkpoint observer: invoked after every committed checkpoint and
+/// at finish; failures abort recovery (resumable) rather than publishing
+/// partial graphs.
+pub type ProgressObserver = Box<dyn FnMut(&biara_cfg::Cfg) -> Result<(), Error> + Send>;
 pub struct Session {
     options: Options,
     store: store::Store,
@@ -87,6 +102,7 @@ pub struct Session {
     pool: Option<Pool>,
     cached: BTreeMap<String, Vec<u8>>,
     versions: checkpoint::Versions,
+    progress: Option<ProgressObserver>,
     last_checkpoint: Instant,
     translated: usize,
     reused: usize,
@@ -101,6 +117,20 @@ impl Session {
     ) -> Result<Self, Error> {
         if options.workers == 0 {
             return Err(Error::Engine("worker budget must be nonzero".into()));
+        }
+        // Half/half partition: coordinator keeps memory_budget/2 and each worker
+        // inherits remaining/workers. Every side needs at least MIN_WORKER_BYTES
+        // of address space (mapped LLVM + libtcg JIT reservation), so the total
+        // minimum is MIN_MEMORY_BYTES.
+        if options.memory_budget < biara_proto::MIN_MEMORY_BYTES {
+            return Err(Error::Engine(
+                "memory budget must be at least 2 GiB for coordinator plus worker".into(),
+            ));
+        }
+        let per_worker = options.memory_budget / 2 / options.workers as u64;
+        if per_worker < biara_proto::MIN_WORKER_BYTES {
+            let clamped = (options.memory_budget / 2 / biara_proto::MIN_WORKER_BYTES) as usize;
+            options.workers = clamped.max(1);
         }
         options.binary = options.binary.canonicalize()?;
         options.libtcg = options.libtcg.canonicalize()?;
@@ -141,6 +171,7 @@ impl Session {
             pool: None,
             cached: BTreeMap::new(),
             versions: checkpoint::Versions::default(),
+            progress: None,
             last_checkpoint: Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
@@ -152,6 +183,37 @@ impl Session {
     }
     pub fn lib(&self) -> Arc<Mutex<Libtcg>> {
         self.library.clone()
+    }
+    /// Total address-space budget shared by coordinator and worker pool.
+    pub fn memory_budget(&self) -> u64 {
+        self.options.memory_budget
+    }
+    /// Coordinator half of the budget. The supervisor sets soft=hard=half on
+    /// the service process; `Session::open` never lowers an inherited ceiling
+    /// (Unix caps are only reducible by descendants), so workers spawned below
+    /// each inherit at most this half and divide it further.
+    pub fn coordinator_budget(&self) -> u64 {
+        self.options.memory_budget / 2
+    }
+    /// Per-worker address-space share of the remaining half. Each spawned
+    /// worker inherits at most this cap via `Pool` pre-exec; the sum of worker
+    /// hard caps plus the coordinator half never exceeds the total budget.
+    pub fn worker_budget(&self) -> u64 {
+        self.options.memory_budget / 2 / self.options.workers.max(1) as u64
+    }
+    /// Actual spawned worker count (clamped at open so each share holds room).
+    /// Supervisors use this, not the requested count, for hard partitioning.
+    pub fn pool_size(&self) -> usize {
+        self.pool
+            .as_ref()
+            .map_or(self.options.workers, |pool| pool.len())
+    }
+    /// Optional durable-checkpoint observer. Invoked after every committed
+    /// checkpoint and at finish; failures abort recovery (resumable) rather
+    /// than publishing partial graphs. Receives the committed `Cfg` by
+    /// reference: emit deltas without copying the full graph.
+    pub fn set_progress(&mut self, observer: ProgressObserver) {
+        self.progress = Some(observer);
     }
     fn pool(&mut self) -> Result<&mut Pool, Error> {
         if self.pool.is_none() {
@@ -167,6 +229,7 @@ impl Session {
                 &self.options.executable,
                 &config,
                 self.options.workers,
+                self.worker_budget(),
             )?);
         }
         Ok(self.pool.as_mut().expect("initialized worker pool"))
@@ -226,6 +289,8 @@ impl Session {
                 active += 1;
             }
             while active != 0 {
+                // Same abort-not-fact contract as resolution: worker/IPC/DB
+                // errors propagate with durable checkpoints intact.
                 let (index, response) = self.pool()?.receive()?;
                 let Response::Translate(results) = response else {
                     return Err(Error::Engine("unexpected translation response".into()));
@@ -267,8 +332,19 @@ impl Session {
         Ok(())
     }
     fn remember(&mut self, key: String, bytes: Vec<u8>) {
-        if self.cached.len() >= 128 {
-            self.cached.pop_first();
+        // Cap transient decoded wire bytes: ~32 MiB or 128 entries, whichever is
+        // smaller, so libcrypto-scale frontiers cannot retain unbounded IR.
+        const MAX_ENTRIES: usize = 128;
+        const MAX_BYTES: usize = 32 * 1024 * 1024;
+        let mut retained: usize = self.cached.values().map(Vec::len).sum();
+        while !self.cached.is_empty()
+            && (self.cached.len() >= MAX_ENTRIES || retained + bytes.len() > MAX_BYTES)
+        {
+            if let Some((_, evicted)) = self.cached.pop_first() {
+                retained = retained.saturating_sub(evicted.len());
+            } else {
+                break;
+            }
         }
         self.cached.insert(key, bytes);
     }
@@ -286,6 +362,11 @@ impl Session {
         );
         Ok(())
     }
+    /// Delete rebuildable per-block job cache rows, keeping durable CFG
+    /// artifacts. Returns deleted row count; resume re-translates as needed.
+    pub fn prune_rebuildable_cache(&mut self) -> Result<usize, Error> {
+        self.store.prune_rebuildable_cache()
+    }
     fn save_checkpoint(
         &mut self,
         cfg: &biara_cfg::Cfg,
@@ -299,6 +380,9 @@ impl Session {
         self.store
             .checkpoint(cfg, &prepared, resolver.as_deref(), finished)?;
         self.versions.commit(cfg, prepared);
+        if let Some(observer) = self.progress.as_mut() {
+            observer(cfg)?;
+        }
         Ok(())
     }
     fn resolve_inner(
@@ -323,6 +407,9 @@ impl Session {
             in_flight.push(job);
         }
         while active != 0 {
+            // Worker/IPC/storage failures abort here with prior checkpoints
+            // intact (resumable); they never become TranslationFailure facts or
+            // a published finished graph.
             let (index, response) = self.pool()?.receive()?;
             let Response::Resolve(artifact) = response else {
                 return Err(Error::Engine("unexpected resolution response".into()));
@@ -388,6 +475,25 @@ impl Session {
         }
         Ok(None)
     }
+}
+/// Copy a consistent, portable snapshot of the job database to `destination`.
+/// Uses SQLite `VACUUM INTO` over a read connection, so the export contains a
+/// checkpointed, host-path-free copy (WAL merged, image snapshot referenced by
+/// content hash under `biara-images/`, resume-safe) even while the live
+/// database keeps its WAL. Parent compresses/uploads the snapshot for jobs.
+pub fn export_database(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), Error> {
+    let db = rusqlite::Connection::open(source)?;
+    db.busy_timeout(std::time::Duration::from_secs(30))?;
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let escaped: String = destination
+        .as_os_str()
+        .to_string_lossy()
+        .replace('\'', "''");
+    db.execute_batch(&format!("VACUUM INTO '{escaped}';"))?;
+    Ok(())
 }
 fn merge(destination: &mut ResolutionArtifact, source: ResolutionArtifact) {
     for (pc, result) in source.targets {
@@ -466,6 +572,7 @@ impl biara_lift::RecoveryBackend for Session {
             graph,
             resolver_graph,
             resolver_state,
+            resolver_state_codec,
             finished,
         } = self
             .store
@@ -480,6 +587,8 @@ impl biara_lift::RecoveryBackend for Session {
                     "resolver checkpoint is missing its dependency state".into(),
                 )
             })?;
+            let bytes = store::decode_blob(resolver_state_codec, &bytes)
+                .map_err(|e| biara_lift::Error::Llvm(e.to_string()))?;
             (
                 Some(manifest),
                 postcard::from_bytes(&bytes).map_err(|e| biara_lift::Error::Llvm(e.to_string()))?,

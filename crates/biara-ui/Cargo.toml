@@ -1,0 +1,36 @@
+[package]
+name = "biara-ui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Interactive binary-analysis UI for biara, built on Rune"
+
+[[bin]]
+name = "biara-ui"
+path = "src/main.rs"
+
+[dependencies]
+biara-abi.workspace = true
+biara-cfg.workspace = true
+biara-engine.workspace = true
+biara-lift.workspace = true
+biara-loader.workspace = true
+biara-proto.workspace = true
+biara-tcg.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+inkwell.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "intel", "instr_info"] }
+cpp_demangle = "0.5"
+rustc-demangle = "0.1"
+msvc-demangler = "0.11"
+yaxpeax-arch = { version = "0.3", default-features = false, features = ["std"] }
+yaxpeax-arm = { version = "0.5", default-features = false, features = ["std"] }
+
+# `tooling` keeps the headless `--snap`, `--tree` and `--script` runs in release builds.
+rune = { git = "https://github.com/anomalyco/rune", rev = "8e1ae9ae3a38e7a2013ce4d947870ffe5eebec08", default-features = false, features = ["accessibility", "dbus", "native-file-dialog", "tooling"] }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "8e1ae9ae3a38e7a2013ce4d947870ffe5eebec08" }
+rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "8e1ae9ae3a38e7a2013ce4d947870ffe5eebec08" }

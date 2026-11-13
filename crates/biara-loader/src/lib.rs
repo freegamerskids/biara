@@ -34,6 +34,8 @@ pub enum Error {
     Arch(object::Architecture),
     #[error("unsupported format {0:?}")]
     Format(BinaryFormat),
+    #[error("malformed image: {0}")]
+    Malformed(&'static str),
 }
 
 #[derive(Clone, Debug)]
@@ -236,15 +238,29 @@ impl Image {
             .filter(|s| s.size() > 0 && is_read(s.flags()))
             .map(|s| {
                 let (off, len) = s.file_range();
-                Segment {
+                // A declared file range can point past the end of a truncated
+                // or hostile input: only file-backed bytes are addressable.
+                let file = if len == 0 {
+                    0..0
+                } else {
+                    let end = off
+                        .checked_add(len)
+                        .filter(|&end| end <= bytes.len() as u64)
+                        .ok_or(Error::Malformed("segment data outside file"))?;
+                    off as usize..end as usize
+                };
+                s.address()
+                    .checked_add(s.size())
+                    .ok_or(Error::Malformed("segment address overflow"))?;
+                Ok(Segment {
                     addr: s.address(),
                     size: s.size(),
                     exec: is_exec(s.flags()),
                     write: is_write(s.flags()),
-                    file: off as usize..(off + len) as usize,
-                }
+                    file,
+                })
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
 
         let mut symbols: Vec<Symbol> = file
             .symbols()
@@ -268,13 +284,20 @@ impl Image {
         let mut code: Vec<Range<u64>> = file
             .sections()
             .filter(|s| s.kind() == SectionKind::Text && s.address() != 0 && s.size() > 0)
-            .map(|s| s.address()..s.address() + s.size())
-            .collect();
+            .map(|s| {
+                let end = s
+                    .address()
+                    .checked_add(s.size())
+                    .ok_or(Error::Malformed("code section address overflow"))?;
+                Ok(s.address()..end)
+            })
+            .collect::<Result<_, Error>>()?;
         if code.is_empty() {
             code = segments
                 .iter()
                 .filter(|s| s.exec)
-                .map(|s| s.addr..s.addr + s.size)
+                // Segments are built with checked bounds, so this cannot wrap.
+                .map(|s| s.addr..s.addr.saturating_add(s.size))
                 .collect();
         }
         code.sort_by_key(|r| r.start);
@@ -436,7 +459,9 @@ impl Image {
             .symbols
             .iter()
             .filter(|s| s.is_function && s.size > 0)
-            .map(|s| s.addr..s.addr + s.size);
+            // Symbols report their own sizes; a hostile size near `u64::MAX`
+            // must saturate into an end-clamped extent, never wrap.
+            .map(|s| s.addr..s.addr.saturating_add(s.size));
         let mut v: Vec<Range<u64>> = self
             .function_ranges
             .iter()
@@ -501,7 +526,7 @@ impl Image {
             return false;
         }
         let w = self.word as u64;
-        let end = addr + buf.len() as u64;
+        let end = addr.saturating_add(buf.len() as u64);
         for (&slot, &v) in self.relocated.range(addr.saturating_sub(w - 1)..end) {
             let bytes = if self.little {
                 v.to_le_bytes()
@@ -548,10 +573,10 @@ fn read_segments(
         return false;
     };
     let off = addr - seg.addr;
-    if off + buf.len() as u64 > seg.size {
+    if buf.len() as u64 > seg.size - off {
         return false;
     }
-    let data = &bytes[seg.file.clone()];
+    let data = bytes.get(seg.file.clone()).unwrap_or(&[]);
     for (i, b) in buf.iter_mut().enumerate() {
         *b = data.get(off as usize + i).copied().unwrap_or(0);
     }
@@ -616,14 +641,23 @@ fn data_words(mem: &Memory, ranges: &[Range<u64>], skip: &dyn Fn(u64) -> bool) -
     let mut out = Vec::new();
     let w = mem.word as u64;
     for r in ranges {
-        let mut a = r.start.next_multiple_of(w);
-        while a + w <= r.end {
+        // Align without `next_multiple_of` (which wraps on overflow): a
+        // hostile range near `u64::MAX` skips instead of panicking.
+        let mut a = match r.start.checked_add(w - 1) {
+            Some(x) => x / w * w,
+            None => continue,
+        };
+        loop {
+            let Some(next) = a.checked_add(w) else { break };
+            if next > r.end {
+                break;
+            }
             if !skip(a)
                 && let Some(v) = mem.word_at(a)
             {
                 out.push(v);
             }
-            a += w;
+            a = next;
         }
     }
     out

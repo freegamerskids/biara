@@ -11,7 +11,7 @@ use std::{
 };
 
 use biara_cfg::{Cfg, Discovery};
-use biara_lift::{ResolveOptions, host_machine, recover_resolving};
+use biara_lift::{ResolveOptions, analysis_machine, recover_resolving};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 
@@ -76,7 +76,7 @@ pub fn recover_program(lib: &mut Libtcg, image: &Image) -> Cfg {
     let starts: Vec<u64> = image.function_starts().into_iter().collect();
     recover_resolving(
         lib,
-        &host_machine().unwrap(),
+        &analysis_machine().unwrap(),
         &|pc| image.code_at(pc),
         &|addr, buf| image.read_const(addr, buf),
         &starts,

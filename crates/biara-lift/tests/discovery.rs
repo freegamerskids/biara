@@ -126,7 +126,7 @@ fn aarch64() {
 #[test]
 fn batched_candidates_reject_covered_interior_labels() {
     use biara_cfg::{Discovery, Options};
-    use biara_lift::{ResolveOptions, host_machine, recover_resolving};
+    use biara_lift::{ResolveOptions, analysis_machine, recover_resolving};
 
     // Four `lea rax,[rdi+rdi*2+i]; ret` callbacks, 16 apart with nop pads:
     // entry covers entry+1..entry+4, interior `ret` sits at entry+5. The
@@ -165,7 +165,7 @@ fn batched_candidates_reject_covered_interior_labels() {
         ..Default::default()
     };
     let lib = Libtcg::load(&Libtcg::find("x86_64").expect("libtcg"), None).unwrap();
-    let machine = host_machine().unwrap();
+    let machine = analysis_machine().unwrap();
     let cfg = recover_resolving(
         &mut *lib.lock(),
         &machine,
@@ -186,7 +186,7 @@ fn batched_candidates_reject_covered_interior_labels() {
 #[test]
 fn independent_candidates_keep_sorted_selection_under_budget() {
     use biara_cfg::{Discovery, Options};
-    use biara_lift::{ResolveOptions, host_machine, recover_resolving};
+    use biara_lift::{ResolveOptions, analysis_machine, recover_resolving};
     // Seven isolated one-byte `ret`s after a one-byte `ret` root: the root
     // reserves the first block, then sorted candidates fill the budget.
     let base: u64 = 0x50_0000;
@@ -211,7 +211,7 @@ fn independent_candidates_keep_sorted_selection_under_budget() {
             ..Default::default()
         };
         let lib = Libtcg::load(&Libtcg::find("x86_64").expect("libtcg"), None).unwrap();
-        let machine = host_machine().unwrap();
+        let machine = analysis_machine().unwrap();
         let cfg = recover_resolving(
             &mut *lib.lock(),
             &machine,

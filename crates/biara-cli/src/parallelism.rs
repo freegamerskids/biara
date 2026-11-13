@@ -20,11 +20,20 @@ use anyhow::Result;
 ///
 /// The options are captured before affinity is touched and are never
 /// recomputed afterwards: shrinking the mask must not shrink the budget.
-pub(crate) fn resolve(requested: Option<NonZeroUsize>) -> Result<biara_lift::DecompileOptions> {
-    let options = match requested {
-        Some(jobs) => biara_lift::DecompileOptions::with_workers(jobs),
-        None => biara_lift::DecompileOptions::default(),
-    };
+pub(crate) fn resolve(
+    requested: Option<NonZeroUsize>,
+    memory_bytes: u64,
+) -> Result<biara_lift::DecompileOptions> {
+    if memory_bytes < biara_proto::MIN_MEMORY_BYTES {
+        anyhow::bail!("analysis memory budget must be at least 2 GiB");
+    }
+    // Match the engine pool's minimum worker share; ABI and LLVM threads
+    // must not retain the larger CPU-only request after recovery clamps it.
+    let memory_workers =
+        usize::try_from(memory_bytes / 2 / biara_proto::MIN_WORKER_BYTES).unwrap_or(usize::MAX);
+    let limit = NonZeroUsize::new(memory_workers).unwrap();
+    let options =
+        biara_lift::DecompileOptions::with_workers(requested.map_or(limit, |n| n.min(limit)));
     #[cfg(target_os = "linux")]
     cap_affinity(options.workers()).context("cannot confine CPU affinity to the job budget")?;
     Ok(options)

@@ -398,15 +398,18 @@ pub(crate) fn run(args: QualityArgs) -> Result<()> {
     // loads its images so redundant copies do not inflate the process peak.
     drop(reference);
     drop(candidate);
-    let workers = crate::parallelism::resolve(args.jobs)?.workers();
+    let workers = crate::parallelism::resolve(args.jobs, 4 * 1024 * 1024 * 1024)?.workers();
     let (reference, reference_cfg, reference_lib) = crate::recover(
         &args.reference,
         &[],
-        args.max_blocks,
         None,
         args.cpu.as_deref(),
         args.database.as_deref(),
-        workers,
+        crate::RecoveryBudget {
+            max_blocks: args.max_blocks,
+            workers,
+            memory_bytes: 4 * 1024 * 1024 * 1024,
+        },
     )?;
     drop(reference_lib);
     let mut function_names: BTreeMap<u64, Vec<&str>> = BTreeMap::new();
@@ -424,11 +427,14 @@ pub(crate) fn run(args: QualityArgs) -> Result<()> {
     let (_, candidate_cfg, candidate_lib) = crate::recover(
         &args.candidate,
         &[],
-        args.max_blocks,
         None,
         args.cpu.as_deref(),
         args.database.as_deref(),
-        workers,
+        crate::RecoveryBudget {
+            max_blocks: args.max_blocks,
+            workers,
+            memory_bytes: 4 * 1024 * 1024 * 1024,
+        },
     )?;
     drop(candidate_lib);
     let functions = compare(

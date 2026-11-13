@@ -11,6 +11,9 @@
 //! addresses, function records with ABI/call/debug facts and source links,
 //! bounded code chunks, and a final readability report. Chunk text concatenates
 //! to the complete function body; continuation fragments are not standalone C.
+//! Function headers include lexical `tokens` and authoritative `symbols`.
+//! Token byte offsets index the complete concatenated body, not a chunk;
+//! unidentified imports/support routines have no fabricated address reference.
 //! Statement IDs are function-address scoped and deterministic for identical
 //! inputs, not persistent identities across binary revisions. Source addresses
 //! are surviving contributors, not exhaustive instruction coverage.
@@ -24,8 +27,8 @@
 use crate::{Format, LiftArgs};
 use anyhow::{Context, Result, bail};
 use biara_cfg::{Cfg, ExitKind};
-use biara_lift::{FunctionPackage, ReadabilityMetrics};
 use biara_loader::Image;
+use biara_proto::{FunctionPackage, ReadabilityMetrics};
 use biara_tcg::Libtcg;
 use inkwell::{context::Context as LlvmContext, targets::TargetMachine};
 use parking_lot::Mutex;
@@ -224,47 +227,6 @@ fn function_facts(
     }).collect();
     json!({"category":if image.function_at(entry).is_some_and(|f|runtime(&f.name)){"runtime"}else{"application_or_unknown"},"callees":callees,"callers":callers,"callers_exhaustive":false,"indirect_transfers":indirect,"abi":abi,"issues":issues,"stack_objects":image.stack_objects.iter().filter(|o|o.function==entry).collect::<Vec<_>>(),"debug_parameters":image.debug_names.iter().filter(|o|o.function==entry).collect::<Vec<_>>()})
 }
-fn debug_register(arch: &str, reg: u16) -> Option<String> {
-    match arch {
-        "x86_64" => [
-            "rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11",
-            "r12", "r13", "r14", "r15",
-        ]
-        .get(reg as usize)
-        .map(|s| s.to_string()),
-        "aarch64" if reg < 31 => Some(format!("x{reg}")),
-        _ => None,
-    }
-}
-pub(crate) fn apply_debug(transformed: &mut biara_lift::TransformedC<'_>, image: &Image) {
-    let names: Vec<_> = image
-        .debug_names
-        .iter()
-        .filter_map(|n| {
-            Some(biara_lift::DebugName {
-                function: n.function,
-                register: debug_register(image.arch, n.register)?,
-                name: n.name.clone(),
-            })
-        })
-        .collect();
-    transformed.apply_debug_names(&names);
-    let objects: Vec<_> = image
-        .stack_objects
-        .iter()
-        .map(|o| biara_lift::DebugObject {
-            function: o.function,
-            start: o.range.start,
-            end: o.range.end,
-            offset: o.offset,
-            size: o.size,
-            name: o.name.clone(),
-            type_name: o.type_name.clone(),
-        })
-        .collect();
-    transformed.apply_debug_objects(&objects);
-}
-
 #[derive(Serialize)]
 struct Chunk<'a> {
     id: String,
@@ -328,7 +290,7 @@ fn chunks(package: &FunctionPackage, limit: usize) -> Vec<Chunk<'_>> {
     }
     chunks
 }
-struct StatementLinks<'a>(&'a [biara_lift::PackageStatement]);
+struct StatementLinks<'a>(&'a [biara_proto::PackageStatement]);
 impl Serialize for StatementLinks<'_> {
     fn serialize<S: serde::Serializer>(
         &self,
@@ -362,10 +324,14 @@ impl Serialize for Header<'_> {
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let p = self.0;
-        let mut map = serializer.serialize_map(Some(7))?;
+        let mut map = serializer.serialize_map(Some(8 + usize::from(p.symbols.is_some())))?;
         map.serialize_entry("address", &p.address)?;
         map.serialize_entry("name", &p.name)?;
         map.serialize_entry("signature", &p.signature)?;
+        map.serialize_entry("tokens", &p.tokens)?;
+        if let Some(symbols) = &p.symbols {
+            map.serialize_entry("symbols", symbols)?;
+        }
         // Body text appears once in chunks; links reference its line numbers.
         map.serialize_entry("statements", &StatementLinks(&p.statements))?;
         map.serialize_entry("dependencies", &p.dependencies)?;
@@ -511,22 +477,32 @@ pub(crate) fn run(
 ) -> Result<()> {
     let selection = select(a, &image, &cfg)?;
     let cx = LlvmContext::create();
-    let abis = biara_abi::analyze_with_workers(&cfg, lib.lock().info(), options.workers())?;
+    let annotations = crate::service::load_annotations(a.annotations.as_deref())?;
+    let mut abis = biara_abi::analyze_with_workers(&cfg, lib.lock().info(), options.workers())?;
+    biara_lift::annotations::apply_abi_annotations(
+        &cfg,
+        lib.lock().info(),
+        &mut abis,
+        &annotations,
+    )?;
     let facts: BTreeMap<_, _> = selection
         .functions
         .iter()
         .map(|&e| (e, function_facts(&image, &cfg, &abis, e)))
         .collect();
     let metadata = json!({"schema_version":1,"kind":"decomp","image":{"path":a.binary,"arch":image.arch,"os":image.os,"entry":image.entry},"selection":selection,"completeness":{"recovery":cfg.recovery,"issues":cfg.issues().collect::<Vec<_>>()},"debug":image.debug_status,"assumptions":["analysis presentation is not standalone executable C","unknown types and source mappings remain unknown","source contributors are surviving metadata, not exhaustive instruction coverage","known callers and indirect candidates need not be exhaustive","readability metrics do not establish semantic correctness","token counts are lexical estimates, not a model tokenizer"]});
-    let prepared = {
+    let selected: BTreeSet<_> = selection.functions.iter().copied().collect();
+    let mut prepared = {
         let guard = lib.lock();
         let name_of = |e| {
-            image
-                .function_at(e)
-                .map(|f| f.name.clone())
+            annotations
+                .functions
+                .get(&e)
+                .and_then(|f| f.name.clone())
+                .or_else(|| image.function_at(e).map(|f| f.name.clone()))
                 .or_else(|| cfg.stub_import(e).map(|s| format!("{s}@plt")))
         };
-        biara_lift::prepare_c(
+        biara_lift::prepare_c_selected(
             &cx,
             machine,
             guard.info(),
@@ -539,14 +515,17 @@ pub(crate) fn run(
                 image.arch
             ),
             &image.data,
+            &selected,
         )?
     };
+    prepared.apply_annotations(&annotations)?;
     drop(abis);
     drop(cfg);
     drop(lib);
     let mut transformed =
         prepared.transform(machine, &|addr, buf| image.read_const(addr, buf), options)?;
-    apply_debug(&mut transformed, &image);
+    transformed.apply_image_debug(&image);
+    transformed.apply_annotations(&annotations)?;
     transformed.select_functions(&selection.functions);
     drop(image);
     let mut all_gates = Vec::new();

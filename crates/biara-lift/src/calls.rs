@@ -30,7 +30,7 @@
 //! (`audit` walks from a call up through its callers).
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
 };
@@ -58,7 +58,7 @@ use crate::{
     memory,
 };
 
-pub(crate) const RETURN_MARKER: &str = "biara.return";
+pub const RETURN_MARKER: &str = "biara.return";
 
 /// A size interval established from allocation arguments, not access spacing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -374,6 +374,7 @@ pub struct CallSites<'a> {
     by_pc: BTreeMap<(u64, u64), std::ops::Range<usize>>,
     memory: BTreeMap<u64, MemoryFacts>,
     register_returns: BTreeMap<u64, BTreeMap<String, Arg>>,
+    resolution_limited: Cell<bool>,
 }
 
 impl<'a> CallSites<'a> {
@@ -394,7 +395,9 @@ impl<'a> CallSites<'a> {
         Self::with_abis(machine, info, cfg, None)
     }
 
-    fn with_abis(
+    /// Annotation-driven ABI overrides: caller supplies the (already
+    /// annotation-merged) map instead of re-running `biara_abi::analyze`.
+    pub fn with_abis(
         machine: &'a TargetMachine,
         info: &'a ContextInfo,
         cfg: &'a Cfg,
@@ -444,6 +447,7 @@ impl<'a> CallSites<'a> {
             by_pc: BTreeMap::new(),
             memory: BTreeMap::new(),
             register_returns: BTreeMap::new(),
+            resolution_limited: Cell::new(false),
         })
     }
 
@@ -524,30 +528,55 @@ impl<'a> CallSites<'a> {
                     && !self.lifted.contains(e)
             })
             .collect();
-        if only.is_empty() {
-            return Ok(());
+        // Caller discovery can expose thousands of bodies at once. Keep raw
+        // LLVM IR bounded by both body count and TCG instruction volume.
+        let mut entries = only.into_iter().peekable();
+        while entries.peek().is_some() {
+            let mut batch = BTreeSet::new();
+            let mut operations = 0usize;
+            while let Some(&entry) = entries.peek() {
+                let size = cfg.functions[&entry]
+                    .blocks
+                    .iter()
+                    .map(|pc| cfg.blocks[pc].block.ops.len())
+                    .fold(0usize, usize::saturating_add);
+                if !batch.is_empty()
+                    && (batch.len() == 32 || operations.saturating_add(size) > 65_536)
+                {
+                    break;
+                }
+                entries.next();
+                batch.insert(entry);
+                operations = operations.saturating_add(size);
+            }
+            let cx = Context::create();
+            let analysis = crate::Analysis {
+                only: &batch,
+                target_markers: false,
+            };
+            let module = crate::lift_with(
+                &cx,
+                self.machine,
+                self.info,
+                cfg,
+                self.abis.as_ref(),
+                &|_| None,
+                "calls",
+                Some(analysis),
+            )?;
+            memory::simplify(&module, self.machine)?;
+            self.collect_unindexed(&module);
         }
-        let cx = Context::create();
-        let analysis = crate::Analysis {
-            only: &only,
-            target_markers: false,
-        };
-        let module = crate::lift_with(
-            &cx,
-            self.machine,
-            self.info,
-            cfg,
-            self.abis.as_ref(),
-            &|_| None,
-            "calls",
-            Some(analysis),
-        )?;
-        memory::simplify(&module, self.machine)?;
-        self.collect(&module);
+        self.index_sites();
         Ok(())
     }
 
     pub(crate) fn collect(&mut self, module: &inkwell::module::Module<'_>) {
+        self.collect_unindexed(module);
+        self.index_sites();
+    }
+
+    fn collect_unindexed(&mut self, module: &inkwell::module::Module<'_>) {
         let pc_kind = module.get_context().get_kind_id(PC_MD);
         for f in module.get_functions() {
             let Some(caller) = f
@@ -563,6 +592,9 @@ impl<'a> CallSites<'a> {
                 self.function_sites(f, caller, pc_kind);
             }
         }
+    }
+
+    fn index_sites(&mut self) {
         self.sites.sort_by_key(|c| (c.caller, c.pc));
         self.by_pc.clear();
         for (index, site) in self.sites.iter().enumerate() {
@@ -795,11 +827,11 @@ impl<'a> CallSites<'a> {
     /// Follow internal return summaries and aliases. Missing summaries and
     /// recursive cycles remain unknown; unbound external inputs remain inputs.
     pub fn resolve_arg(&self, arg: &Arg, caller: u64) -> Arg {
-        self.resolve_bound(arg, caller, 0, &[], 0)
+        self.resolve_bound(arg, caller, 0, &[], 0, &mut 256)
     }
 
     pub(crate) fn substitute_arg(&self, arg: &Arg, callee: u64, call: &CallSite) -> Arg {
-        self.resolve_bound(arg, callee, call.pc, &[call], 0)
+        self.resolve_bound(arg, callee, call.pc, &[call], 0, &mut 256)
     }
 
     fn calls_at(&self, function: u64, pc: u64) -> &[CallSite] {
@@ -808,6 +840,7 @@ impl<'a> CallSites<'a> {
             .map_or(&[], |range| &self.sites[range.clone()])
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_bound(
         &self,
         arg: &Arg,
@@ -815,10 +848,15 @@ impl<'a> CallSites<'a> {
         pc: u64,
         bindings: &[&CallSite],
         depth: usize,
+        budget: &mut usize,
     ) -> Arg {
-        if depth >= 64 || bindings.len() > 16 {
+        // Depth alone permits exponential expansion of branching return
+        // summaries. All sibling paths share a finite per-query work budget.
+        if depth >= 64 || bindings.len() > 16 || *budget == 0 {
+            self.resolution_limited.set(true);
             return Arg::Unknown;
         }
+        *budget -= 1;
         match arg {
             Arg::Incoming(reg) => {
                 let Some(binding) = bindings
@@ -840,7 +878,14 @@ impl<'a> CallSites<'a> {
                             .and_then(|i| binding.args.get(i))
                     })
                     .map_or(Arg::Unknown, |arg| {
-                        self.resolve_bound(arg, binding.caller, binding.pc, bindings, depth + 1)
+                        self.resolve_bound(
+                            arg,
+                            binding.caller,
+                            binding.pc,
+                            bindings,
+                            depth + 1,
+                            budget,
+                        )
                     })
             }
             Arg::Deref { reg, off } => self.resolve_load(
@@ -850,15 +895,16 @@ impl<'a> CallSites<'a> {
                 pc,
                 bindings,
                 depth + 1,
+                budget,
             ),
             Arg::Load { base, off, bits } => {
-                self.resolve_load(base, (*off, *bits), at, pc, bindings, depth + 1)
+                self.resolve_load(base, (*off, *bits), at, pc, bindings, depth + 1, budget)
             }
             Arg::Expr { op, bits, args } => Arg::expression(
                 *op,
                 *bits,
                 args.iter()
-                    .map(|arg| self.resolve_bound(arg, at, pc, bindings, depth + 1))
+                    .map(|arg| self.resolve_bound(arg, at, pc, bindings, depth + 1, budget))
                     .collect(),
             ),
             Arg::FunctionResult { function, pc } | Arg::RegisterResult { function, pc, .. } => {
@@ -872,7 +918,11 @@ impl<'a> CallSites<'a> {
                 let Some(summary) = self.result_summary(arg) else {
                     return Arg::Unknown;
                 };
+                if bindings.iter().any(|bound| std::ptr::eq(*bound, call)) {
+                    return Arg::Unknown;
+                }
                 if bindings.len() == 16 {
+                    self.resolution_limited.set(true);
                     return Arg::Unknown;
                 }
                 let mut next = [call; 16];
@@ -884,6 +934,7 @@ impl<'a> CallSites<'a> {
                     0,
                     &next[..bindings.len() + 1],
                     depth + 1,
+                    budget,
                 )
             }
             Arg::Returned { import, pc } => {
@@ -896,9 +947,9 @@ impl<'a> CallSites<'a> {
                 };
                 let base = import.split('@').next().unwrap_or(import);
                 let base = base.strip_prefix("__").unwrap_or(base);
-                let get = |i: usize| {
+                let mut get = |i: usize| {
                     call.args.get(i).map_or(Arg::Unknown, |arg| {
-                        self.resolve_bound(arg, at, *pc, bindings, depth + 1)
+                        self.resolve_bound(arg, at, *pc, bindings, depth + 1, budget)
                     })
                 };
                 match base {
@@ -947,16 +998,17 @@ impl<'a> CallSites<'a> {
                         binding.pc,
                         bindings,
                         depth + 1,
+                        budget,
                     )
                 })
             }
             Arg::Offset { base, off } => self
-                .resolve_bound(base, at, pc, bindings, depth + 1)
+                .resolve_bound(base, at, pc, bindings, depth + 1, budget)
                 .offset(*off),
             Arg::OneOf(values) => {
                 let mut result = Vec::with_capacity(values.len());
                 for value in values {
-                    let value = self.resolve_bound(value, at, pc, bindings, depth + 1);
+                    let value = self.resolve_bound(value, at, pc, bindings, depth + 1, budget);
                     if !result.contains(&value) {
                         result.push(value);
                     }
@@ -971,10 +1023,19 @@ impl<'a> CallSites<'a> {
         }
     }
 
-    fn bind_pointer(&self, arg: &Arg, at: u64, binding: &CallSite, depth: usize) -> Arg {
-        if depth >= 64 {
+    fn bind_pointer(
+        &self,
+        arg: &Arg,
+        at: u64,
+        binding: &CallSite,
+        depth: usize,
+        budget: &mut usize,
+    ) -> Arg {
+        if depth >= 64 || *budget == 0 {
+            self.resolution_limited.set(true);
             return Arg::Unknown;
         }
+        *budget -= 1;
         match arg {
             Arg::Incoming(reg) => binding
                 .registers
@@ -992,23 +1053,24 @@ impl<'a> CallSites<'a> {
                 .cloned()
                 .unwrap_or(Arg::Unknown)
                 .offset(*off),
-            Arg::Offset { base, off } => {
-                self.bind_pointer(base, at, binding, depth + 1).offset(*off)
-            }
+            Arg::Offset { base, off } => self
+                .bind_pointer(base, at, binding, depth + 1, budget)
+                .offset(*off),
             Arg::Expr { op, bits, args } => Arg::expression(
                 *op,
                 *bits,
                 args.iter()
-                    .map(|a| self.bind_pointer(a, at, binding, depth + 1))
+                    .map(|a| self.bind_pointer(a, at, binding, depth + 1, budget))
                     .collect(),
             ),
             Arg::FunctionResult { .. } | Arg::RegisterResult { .. } => {
-                self.resolve_bound(arg, at, binding.pc, &[binding], depth + 1)
+                self.resolve_bound(arg, at, binding.pc, &[binding], depth + 1, budget)
             }
             _ => arg.clone(),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_load(
         &self,
         base: &Arg,
@@ -1017,17 +1079,20 @@ impl<'a> CallSites<'a> {
         pc: u64,
         bindings: &[&CallSite],
         depth: usize,
+        budget: &mut usize,
     ) -> Arg {
         let (off, bits) = load;
-        if depth >= 64 {
+        if depth >= 64 || *budget == 0 {
+            self.resolution_limited.set(true);
             return Arg::Unknown;
         }
+        *budget -= 1;
         let Some(binding) = bindings
             .iter()
             .rev()
             .find(|c| matches!(c.callee, Callee::Function(f) if f == at))
         else {
-            let base = self.resolve_bound(base, at, pc, bindings, depth + 1);
+            let base = self.resolve_bound(base, at, pc, bindings, depth + 1, budget);
             return match base {
                 Arg::Incoming(reg) if bits == 64 => Arg::Deref { reg, off },
                 base => Arg::Load {
@@ -1037,7 +1102,9 @@ impl<'a> CallSites<'a> {
                 },
             };
         };
-        let pointer = self.bind_pointer(base, at, binding, depth + 1).offset(off);
+        let pointer = self
+            .bind_pointer(base, at, binding, depth + 1, budget)
+            .offset(off);
         let address = match &pointer {
             Arg::Stack(off) => Some(Address {
                 reg: self.sp,
@@ -1077,6 +1144,7 @@ impl<'a> CallSites<'a> {
                         binding.pc,
                         bindings,
                         depth + 1,
+                        budget,
                     );
                 }
                 Read::Entry => {
@@ -1087,6 +1155,7 @@ impl<'a> CallSites<'a> {
                         binding.pc,
                         bindings,
                         depth + 1,
+                        budget,
                     );
                 }
                 Read::Unknown => return Arg::Unknown,
@@ -1104,8 +1173,8 @@ impl<'a> CallSites<'a> {
         }
     }
 
-    pub(crate) fn memory_limited(&self) -> bool {
-        self.memory.values().any(|facts| facts.limited)
+    pub(crate) fn analysis_limited(&self) -> bool {
+        self.resolution_limited.get() || self.memory.values().any(|facts| facts.limited)
     }
 
     /// Return summaries needed by a value, for demand-driven lifting.
@@ -2280,6 +2349,123 @@ fn is_memory_intrinsic(call: InstructionValue) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summaries<'a>(
+        machine: &'a TargetMachine,
+        info: &'a ContextInfo,
+        cfg: &'a Cfg,
+    ) -> CallSites<'a> {
+        CallSites {
+            machine,
+            info,
+            cfg,
+            abis: None,
+            sp: 0,
+            homes: HashMap::new(),
+            ret: 0,
+            args: Vec::new(),
+            home: (0, 0),
+            lifted: BTreeSet::new(),
+            sites: Vec::new(),
+            returns: BTreeMap::new(),
+            by_pc: BTreeMap::new(),
+            memory: BTreeMap::new(),
+            register_returns: BTreeMap::new(),
+            resolution_limited: Cell::new(false),
+        }
+    }
+
+    fn empty_info() -> ContextInfo {
+        ContextInfo {
+            arch: "x86_64".into(),
+            cpu_model: "max".into(),
+            guest_bits: 64,
+            globals: Vec::new().into(),
+            pc_global: 0,
+            env_global: 0,
+            insn_start_words: 1,
+            env_size: 0,
+        }
+    }
+
+    #[test]
+    fn cyclic_return_bindings_preserve_known_arms_without_expanding_the_cycle() {
+        let machine = crate::analysis_machine().unwrap();
+        let info = empty_info();
+        let cfg = Cfg::default();
+        let mut sites = summaries(&machine, &info, &cfg);
+        let result = Arg::FunctionResult {
+            function: 2,
+            pc: 10,
+        };
+        sites.sites.push(CallSite {
+            caller: 1,
+            pc: 10,
+            callee: Callee::Function(2),
+            args: Vec::new(),
+            registers: BTreeMap::from([(
+                "rdi".into(),
+                Arg::OneOf(vec![Arg::Const(7), result.clone()]),
+            )]),
+        });
+        sites.by_pc.insert((10, 1), 0..1);
+        sites.returns.insert(2, Arg::Incoming("rdi".into()));
+        assert_eq!(
+            sites.resolve_arg(&result, 1),
+            Arg::OneOf(vec![Arg::Const(7), Arg::Unknown])
+        );
+    }
+
+    #[test]
+    fn branching_return_summaries_share_a_budget_and_keep_small_queries_precise() {
+        let machine = crate::analysis_machine().unwrap();
+        let info = empty_info();
+        let cfg = Cfg::default();
+        let mut sites = summaries(&machine, &info, &cfg);
+        for caller in 1..=10 {
+            let pc = caller * 100;
+            let child = Arg::FunctionResult {
+                function: caller + 1,
+                pc,
+            };
+            sites
+                .by_pc
+                .insert((pc, caller), sites.sites.len()..sites.sites.len() + 1);
+            sites.sites.push(CallSite {
+                caller,
+                pc,
+                callee: Callee::Function(caller + 1),
+                args: Vec::new(),
+                registers: BTreeMap::new(),
+            });
+            sites.returns.insert(
+                caller,
+                Arg::expression(IntOp::Add, 64, vec![child.clone(), child]),
+            );
+        }
+        sites.returns.insert(11, Arg::Const(3));
+        assert_eq!(
+            sites.resolve_arg(
+                &Arg::FunctionResult {
+                    function: 2,
+                    pc: 100
+                },
+                1
+            ),
+            Arg::Unknown
+        );
+        assert!(sites.analysis_limited());
+        assert_eq!(
+            sites.resolve_arg(
+                &Arg::FunctionResult {
+                    function: 11,
+                    pc: 1000
+                },
+                10
+            ),
+            Arg::Const(3)
+        );
+    }
 
     #[test]
     fn foreign_load_requires_a_nonwriting_call() {

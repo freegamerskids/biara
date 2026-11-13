@@ -1,0 +1,21 @@
+[package]
+name = "biara-loader-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+biara-loader = { path = ".." }
+
+[[bin]]
+name = "parse_image"
+path = "fuzz_targets/parse_image.rs"
+test = false
+doc = false
+
+[workspace]

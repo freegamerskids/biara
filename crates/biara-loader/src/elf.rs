@@ -149,13 +149,14 @@ fn init_fini(file: &object::File, mem: &Memory) -> Vec<u64> {
     let w = mem.word as u64;
     let mut out = Vec::new();
     let tag = |t: object::elf::DynamicTag| Some(t.0 as u64);
-    for a in (addr..addr + size).step_by(2 * mem.word) {
+    for a in (addr..addr.saturating_add(size)).step_by(2 * mem.word) {
         let t = mem.word_at(a);
         if t.is_none() || t == tag(object::elf::DT_NULL) {
             break;
         }
         if t == tag(object::elf::DT_INIT) || t == tag(object::elf::DT_FINI) {
-            out.extend(mem.word_at(a + w));
+            // Hostile `p_vaddr` near `u64::MAX` must not wrap the slot.
+            out.extend(a.checked_add(w).and_then(|slot| mem.word_at(slot)));
         }
     }
     out
@@ -199,16 +200,19 @@ fn dynamic_relocations(file: &object::File, mem: &Memory) -> (BTreeMap<u64, u64>
             let entry = mem.decode(chunk);
             if entry & 1 == 0 {
                 relocated.extend(mem.word_at(entry).map(|v| (entry, v)));
-                next = entry + w;
+                next = entry.saturating_add(w);
             } else {
                 let bits = w * 8 - 1;
                 for i in 0..bits {
-                    let slot = next + i * w;
-                    if entry >> (i + 1) & 1 != 0 {
+                    // `i * w` is bounded (`i < bits <= 63`, `w <= 8`), but a
+                    // hostile base `next` could wrap: skip that slot.
+                    if entry >> (i + 1) & 1 != 0
+                        && let Some(slot) = next.checked_add(i * w)
+                    {
                         relocated.extend(mem.word_at(slot).map(|v| (slot, v)));
                     }
                 }
-                next += bits * w;
+                next = next.saturating_add(bits * w);
             }
         }
     }

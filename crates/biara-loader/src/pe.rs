@@ -200,13 +200,13 @@ where
         return Vec::new();
     };
     let size = dir.size.get(LE) as usize;
-    let Some((file_off, _)) = file
+    let Some(data) = file
         .section_table()
-        .pe_file_range_at(dir.virtual_address.get(LE))
+        .pe_data_at(file.data(), dir.virtual_address.get(LE))
+        .and_then(|data| data.get(..size.min(1 << 20)))
     else {
         return Vec::new();
     };
-    let data = &file.data()[file_off as usize..][..size.min(1 << 20)];
     let mut out = Vec::new();
     let base = file.nt_headers().optional_header().image_base();
     // x64 uses 12-byte entries; ARM64 8 bytes unless flag 0 selects 12.
@@ -222,8 +222,8 @@ where
                 2 => (0, 8), // fragment: end unknown, keep the start
                 _ => (u64::from(xd >> 14) * 8, 12),
             };
-            let start = base.wrapping_add(begin as u64);
-            out.push(start..start + len.max(4));
+            let start = base.saturating_add(begin as u64);
+            out.push(start..start.saturating_add(len.max(4)));
             i += stride;
         }
     } else {
@@ -234,7 +234,7 @@ where
             if begin == 0 && end == 0 {
                 break;
             }
-            out.push(base.wrapping_add(begin as u64)..base.wrapping_add(end as u64));
+            out.push(base.saturating_add(begin as u64)..base.saturating_add(end as u64));
             i += 12;
         }
     }

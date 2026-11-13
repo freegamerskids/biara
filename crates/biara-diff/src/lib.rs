@@ -11,6 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use biara_cfg::{Cfg, CfgIssue, ExitKind};
 use biara_loader::Image;
+use biara_proto::diff::{
+    BlockPair, BlockStatus, DiffIssue, DiffReport, FunctionDiff, FunctionKind, Side,
+};
 use biara_tcg::{Block, Opcode, TempId, TempKind};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 
@@ -205,15 +208,18 @@ impl Code {
             })
     }
 
-    fn comparison(
-        &self,
-        other: &Self,
+    /// Compare one positional block pair: 0 equal, 1 uncertain, 2 changed.
+    /// Mirrors [`Code::comparison`]'s atom evidence at block granularity so
+    /// per-function maps can never contradict the function classification.
+    fn compare_block(
+        old_ops: &[Operation],
+        old_exits: &[Vec<Atom>],
+        new_ops: &[Operation],
+        new_exits: &[Vec<Atom>],
         pairs: &BTreeMap<u64, u64>,
         ambiguous: &BTreeSet<u64>,
         reverse: &BTreeMap<u64, u64>,
     ) -> u8 {
-        // Ambiguous references are uncertainty, not independent code changes.
-        // A separate literal/opcode/operand difference still proves a change.
         let atoms = |old: &[Atom], new: &[Atom]| {
             if old.len() != new.len() {
                 return 2;
@@ -239,26 +245,40 @@ impl Code {
                 .max()
                 .unwrap_or(0)
         };
+        if old_ops.len() != new_ops.len() || old_exits.len() != new_exits.len() {
+            return 2;
+        }
+        let mut state = 0;
+        for (o, n) in old_ops.iter().zip(new_ops) {
+            if o.name != n.name || o.ty != n.ty || o.vece != n.vece {
+                return 2;
+            }
+            state = state
+                .max(atoms(&o.outputs, &n.outputs))
+                .max(atoms(&o.inputs, &n.inputs))
+                .max(atoms(&o.constants, &n.constants));
+        }
+        for (o, n) in old_exits.iter().zip(new_exits) {
+            state = state.max(atoms(o, n));
+        }
+        state
+    }
+
+    fn comparison(
+        &self,
+        other: &Self,
+        pairs: &BTreeMap<u64, u64>,
+        ambiguous: &BTreeSet<u64>,
+        reverse: &BTreeMap<u64, u64>,
+    ) -> u8 {
         if self.blocks.len() != other.blocks.len() {
             return 2;
         }
         let mut state = 0;
         for ((ops, exits), (new_ops, new_exits)) in self.blocks.iter().zip(&other.blocks) {
-            if ops.len() != new_ops.len() || exits.len() != new_exits.len() {
-                return 2;
-            }
-            for (o, n) in ops.iter().zip(new_ops) {
-                if o.name != n.name || o.ty != n.ty || o.vece != n.vece {
-                    return 2;
-                }
-                state = state
-                    .max(atoms(&o.outputs, &n.outputs))
-                    .max(atoms(&o.inputs, &n.inputs))
-                    .max(atoms(&o.constants, &n.constants));
-            }
-            for (o, n) in exits.iter().zip(new_exits) {
-                state = state.max(atoms(o, n));
-            }
+            state = state.max(Self::compare_block(
+                ops, exits, new_ops, new_exits, pairs, ambiguous, reverse,
+            ));
         }
         state
     }
@@ -268,6 +288,9 @@ impl Code {
 pub struct Program {
     fps: BTreeMap<u64, Fingerprint>,
     codes: BTreeMap<u64, Code>,
+    /// Guest block addresses in the same order as `Code.blocks`, so reports
+    /// can map positional pairs back to guest addresses.
+    block_addrs: BTreeMap<u64, Vec<u64>>,
     shapes: BTreeMap<u64, Shape>,
     names: BTreeMap<u64, String>,
     symbols: BTreeMap<u64, String>,
@@ -304,9 +327,11 @@ impl Program {
             })
             .collect();
         let mut codes = BTreeMap::new();
+        let mut block_addrs: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         let mut issues = Vec::new();
         let mut incomplete = BTreeSet::new();
         for &entry in cfg.functions.keys() {
+            block_addrs.insert(entry, block_order(cfg, entry));
             let (code, unsupported) = normalize(cfg, entry, Some(image));
             if !unsupported.is_empty() {
                 incomplete.insert(entry);
@@ -376,6 +401,7 @@ impl Program {
         Self {
             fps,
             codes,
+            block_addrs,
             shapes,
             names,
             symbols,
@@ -401,12 +427,24 @@ impl Program {
     }
 }
 
+/// Pairing plus per-pair evidence state (0 equal, 1 uncertain, 2 changed),
+/// shared by [`diff`] and [`report`] so the JSON report can never drift from
+/// the human-readable classification.
+struct Analysis {
+    pairs: BTreeMap<u64, u64>,
+    ambiguous: BTreeSet<u64>,
+    reverse: BTreeMap<u64, u64>,
+    states: BTreeMap<u64, u8>,
+    leftover_old: BTreeSet<u64>,
+    leftover_new: BTreeSet<u64>,
+}
+
 /// Pair unique symbol names first, then full structural shapes. Duplicate shape
 /// groups are paired deterministically but conservatively classified uncertain.
 /// A literal change does not destroy a structural match, and hashes never decide
 /// equality. Callee changes and uncertainty propagate to a fixed point, including
 /// across recursive components of any size.
-pub fn diff(old: &Program, new: &Program) -> Vec<Match> {
+fn analyze(old: &Program, new: &Program) -> Analysis {
     let mut ro: BTreeSet<u64> = old
         .codes
         .keys()
@@ -501,18 +539,385 @@ pub fn diff(old: &Program, new: &Program) -> Vec<Match> {
             }
         }
     }
-    let mut out: Vec<Match> = pairs
-        .into_iter()
-        .map(|(old, new)| match states[&old] {
-            0 => Match::Same { old, new },
-            2 => Match::Changed { old, new },
-            _ => Match::Uncertain { old, new },
+    Analysis {
+        pairs,
+        ambiguous,
+        reverse,
+        states,
+        leftover_old: ro,
+        leftover_new: rn,
+    }
+}
+
+/// Pair unique symbol names first, then full structural shapes. Duplicate shape
+/// groups are paired deterministically but conservatively classified uncertain.
+/// A literal change does not destroy a structural match, and hashes never decide
+/// equality. Callee changes and uncertainty propagate to a fixed point, including
+/// across recursive components of any size.
+pub fn diff(old: &Program, new: &Program) -> Vec<Match> {
+    matches_from(&analyze(old, new))
+}
+
+fn matches_from(analysis: &Analysis) -> Vec<Match> {
+    let mut out: Vec<Match> = analysis
+        .pairs
+        .iter()
+        .map(|(&o, &n)| match analysis.states[&o] {
+            0 => Match::Same { old: o, new: n },
+            2 => Match::Changed { old: o, new: n },
+            _ => Match::Uncertain { old: o, new: n },
         })
         .collect();
-    out.extend(ro.into_iter().map(|old| Match::Removed { old }));
-    out.extend(rn.into_iter().map(|new| Match::Added { new }));
+    out.extend(
+        analysis
+            .leftover_old
+            .iter()
+            .copied()
+            .map(|old| Match::Removed { old }),
+    );
+    out.extend(
+        analysis
+            .leftover_new
+            .iter()
+            .copied()
+            .map(|new| Match::Added { new }),
+    );
     out.sort_by_key(Match::sort_key);
     out
+}
+
+/// Build the portable [`DiffReport`] for `matches` (see [`diff`]).
+///
+/// `matches` must be a complete pairing of `old` and `new` (normally the
+/// output of [`diff`]): every non-stub function of each program appears
+/// exactly once, either paired (same/changed/uncertain) or single-sided
+/// (added/removed). Entries that are not part of this old/new pairing
+/// (unknown functions, stubs, unsupported pairings) are excluded from
+/// `functions` and recorded as explicit [`DiffIssue::Inconsistent`] entries,
+/// so no supplied row disappears silently; ambiguous or incomplete
+/// evidence is reported as uncertainty rather than dropped.
+///
+/// Block pairs are positional: the i-th topology-ordered block of the old
+/// function pairs with the i-th of the new. Length mismatches surface as
+/// explicit added/removed tails; [`BlockStatus::Changed`] requires a real
+/// opcode/operand/literal/callee difference under the same evidence rules
+/// as [`Match::Changed`].
+pub fn report(old: &Program, new: &Program, matches: &[Match]) -> DiffReport {
+    report_analyzed(old, new, matches, analyze(old, new))
+}
+
+/// Compare both programs and build their complete portable report in one pass.
+pub fn compare(old: &Program, new: &Program) -> DiffReport {
+    let analysis = analyze(old, new);
+    let matches = matches_from(&analysis);
+    report_analyzed(old, new, &matches, analysis)
+}
+
+fn report_analyzed(
+    old: &Program,
+    new: &Program,
+    matches: &[Match],
+    analysis: Analysis,
+) -> DiffReport {
+    // Reuse diff's pairing evidence; the caller's kinds only order output.
+    // Every reported fact (kind, confidence, blocks, issues) derives from
+    // the same states, so the report cannot contradict `diff`/`describe`.
+    let mut functions = Vec::new();
+    let mut issues = Vec::new();
+    for m in matches {
+        let (o, n) = match *m {
+            Match::Same { old, new }
+            | Match::Changed { old, new }
+            | Match::Uncertain { old, new } => (Some(old), Some(new)),
+            Match::Added { new } => (None, Some(new)),
+            Match::Removed { old } => (Some(old), None),
+        };
+        let paired = o.is_some() && n.is_some();
+        let valid = match (o, n) {
+            (Some(o), Some(n)) => {
+                analysis.pairs.get(&o) == Some(&n)
+                    && !old.stubs.contains(&o)
+                    && !new.stubs.contains(&n)
+                    && old.codes.contains_key(&o)
+                    && new.codes.contains_key(&n)
+            }
+            (None, Some(n)) => {
+                analysis.leftover_new.contains(&n)
+                    && !new.stubs.contains(&n)
+                    && new.codes.contains_key(&n)
+            }
+            (Some(o), None) => {
+                analysis.leftover_old.contains(&o)
+                    && !old.stubs.contains(&o)
+                    && old.codes.contains_key(&o)
+            }
+            (None, None) => false,
+        };
+        if !valid {
+            issues.push(DiffIssue::Inconsistent {
+                detail: format!("match {m:?} is not part of this old/new pairing"),
+            });
+            continue;
+        }
+        let (o, n) = (o.unwrap_or(0), n.unwrap_or(0));
+        let state = if paired { analysis.states[&o] } else { 2 };
+        let uncertain_pair = paired
+            && (analysis.ambiguous.contains(&o)
+                || old.incomplete.contains(&o)
+                || new.incomplete.contains(&n));
+        let (kind, confidence) = match (paired, state, uncertain_pair) {
+            (false, _, _) => (
+                if matches!(m, Match::Added { .. }) {
+                    FunctionKind::Added
+                } else {
+                    FunctionKind::Removed
+                },
+                1.0,
+            ),
+            (true, 0, false) => (FunctionKind::Same, 1.0),
+            (true, 2, false) => (FunctionKind::Changed, 1.0),
+            _ => (
+                FunctionKind::Uncertain,
+                if analysis.ambiguous.contains(&o) {
+                    0.2
+                } else {
+                    0.5
+                },
+            ),
+        };
+        let uncertain = kind == FunctionKind::Uncertain;
+        let mut reasons: Vec<String> = Vec::new();
+        if paired && analysis.ambiguous.contains(&o) {
+            reasons.push(format!(
+                "ambiguous structural pairing of {o:#x} with {n:#x}"
+            ));
+        }
+        if paired && old.incomplete.contains(&o) {
+            reasons.push(format!("incomplete recovery of old function {o:#x}"));
+        }
+        if paired && new.incomplete.contains(&n) {
+            reasons.push(format!("incomplete recovery of new function {n:#x}"));
+        }
+        let blocks = match (kind, paired) {
+            (FunctionKind::Added, _) => new
+                .block_addrs
+                .get(&n)
+                .map(|addrs| {
+                    addrs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &addr)| BlockPair {
+                            old_block: None,
+                            new_block: Some(addr),
+                            old_index: None,
+                            new_index: Some(i),
+                            status: BlockStatus::Added,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            (FunctionKind::Removed, _) => old
+                .block_addrs
+                .get(&o)
+                .map(|addrs| {
+                    addrs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &addr)| BlockPair {
+                            old_block: Some(addr),
+                            new_block: None,
+                            old_index: Some(i),
+                            new_index: None,
+                            status: BlockStatus::Removed,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => {
+                let old_code = &old.codes[&o];
+                let new_code = &new.codes[&n];
+                let old_addrs: &[u64] = old.block_addrs.get(&o).map(Vec::as_slice).unwrap_or(&[]);
+                let new_addrs: &[u64] = new.block_addrs.get(&n).map(Vec::as_slice).unwrap_or(&[]);
+                let common = old_code.blocks.len().min(new_code.blocks.len());
+                let mut pairs_out = Vec::new();
+                for i in 0..common {
+                    let ((ops, exits), (new_ops, new_exits)) =
+                        (&old_code.blocks[i], &new_code.blocks[i]);
+                    let block_state = Code::compare_block(
+                        ops,
+                        exits,
+                        new_ops,
+                        new_exits,
+                        &analysis.pairs,
+                        &analysis.ambiguous,
+                        &analysis.reverse,
+                    );
+                    let status = match (uncertain, block_state) {
+                        (true, 2) => BlockStatus::Changed,
+                        (true, _) => BlockStatus::Uncertain,
+                        (false, 0) => BlockStatus::Same,
+                        (false, 1) => BlockStatus::Uncertain,
+                        (false, _) => BlockStatus::Changed,
+                    };
+                    if status == BlockStatus::Changed {
+                        reasons.push(format!(
+                            "block {i} differs (old {:#x}, new {:#x})",
+                            old_addrs.get(i).copied().unwrap_or(0),
+                            new_addrs.get(i).copied().unwrap_or(0),
+                        ));
+                    }
+                    pairs_out.push(BlockPair {
+                        old_block: old_addrs.get(i).copied(),
+                        new_block: new_addrs.get(i).copied(),
+                        old_index: Some(i),
+                        new_index: Some(i),
+                        status,
+                    });
+                }
+                // Topology-order length mismatch: extra blocks are explicit
+                // added/removed tails with correct guest addresses.
+                for (i, &addr) in old_addrs.iter().enumerate().skip(common) {
+                    reasons.push(format!("removed block {i} at old {addr:#x}"));
+                    pairs_out.push(BlockPair {
+                        old_block: Some(addr),
+                        new_block: None,
+                        old_index: Some(i),
+                        new_index: None,
+                        status: BlockStatus::Removed,
+                    });
+                }
+                for (i, &addr) in new_addrs.iter().enumerate().skip(common) {
+                    reasons.push(format!("added block {i} at new {addr:#x}"));
+                    pairs_out.push(BlockPair {
+                        old_block: None,
+                        new_block: Some(addr),
+                        old_index: None,
+                        new_index: Some(i),
+                        status: BlockStatus::Added,
+                    });
+                }
+                // Callee-driven change: no direct block difference, but a
+                // matched callee changed.
+                if kind == FunctionKind::Changed
+                    && !pairs_out.iter().any(|b| {
+                        b.status == BlockStatus::Changed
+                            || b.status == BlockStatus::Added
+                            || b.status == BlockStatus::Removed
+                    })
+                {
+                    reasons.push("matched callee changed".into());
+                }
+                // Uncertain only through a callee: say so, so the report explains itself.
+                if kind == FunctionKind::Uncertain && reasons.is_empty() {
+                    reasons.push("a matched callee is uncertain or ambiguous".into());
+                }
+                pairs_out
+            }
+        };
+        let mut reasons_out = reasons;
+        reasons_out.sort();
+        reasons_out.dedup();
+        functions.push(FunctionDiff {
+            kind,
+            old_function: if paired || kind == FunctionKind::Removed {
+                Some(o)
+            } else {
+                None
+            },
+            new_function: if paired || kind == FunctionKind::Added {
+                Some(n)
+            } else {
+                None
+            },
+            old_name: (paired || kind == FunctionKind::Removed)
+                .then(|| old.name_of(o))
+                .flatten(),
+            new_name: (paired || kind == FunctionKind::Added)
+                .then(|| new.name_of(n))
+                .flatten(),
+            confidence,
+            uncertain,
+            reasons: reasons_out,
+            blocks,
+        });
+    }
+    functions.sort_by(|a, b| {
+        let key = |f: &FunctionDiff| {
+            (
+                match f.kind {
+                    FunctionKind::Same => 0,
+                    FunctionKind::Changed => 1,
+                    FunctionKind::Uncertain => 2,
+                    FunctionKind::Added => 3,
+                    FunctionKind::Removed => 4,
+                },
+                f.old_function.unwrap_or(0),
+                f.new_function.unwrap_or(0),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    for issue in old.comparison_issues() {
+        issues.push(match issue {
+            ComparisonIssue::Unsupported {
+                function,
+                block,
+                operation,
+            } => DiffIssue::Unsupported {
+                side: Side::Old,
+                function: *function,
+                block: *block,
+                operation: operation.clone(),
+            },
+            ComparisonIssue::Incomplete {
+                function,
+                address,
+                reason,
+            } => DiffIssue::Incomplete {
+                side: Side::Old,
+                function: *function,
+                address: *address,
+                reason: reason.clone(),
+            },
+            ComparisonIssue::Ambiguous { functions } => DiffIssue::Ambiguous {
+                side: Side::Old,
+                functions: functions.clone(),
+            },
+        });
+    }
+    for issue in new.comparison_issues() {
+        issues.push(match issue {
+            ComparisonIssue::Unsupported {
+                function,
+                block,
+                operation,
+            } => DiffIssue::Unsupported {
+                side: Side::New,
+                function: *function,
+                block: *block,
+                operation: operation.clone(),
+            },
+            ComparisonIssue::Incomplete {
+                function,
+                address,
+                reason,
+            } => DiffIssue::Incomplete {
+                side: Side::New,
+                function: *function,
+                address: *address,
+                reason: reason.clone(),
+            },
+            ComparisonIssue::Ambiguous { functions } => DiffIssue::Ambiguous {
+                side: Side::New,
+                functions: functions.clone(),
+            },
+        });
+    }
+    DiffReport {
+        version: biara_proto::SCHEMA_VERSION,
+        functions,
+        issues,
+    }
 }
 
 fn block_order(cfg: &Cfg, entry: u64) -> Vec<u64> {
@@ -1098,6 +1503,15 @@ mod tests {
         let codes: BTreeMap<u64, Code> = entries.into_iter().collect();
         let shapes: BTreeMap<u64, Shape> = codes.iter().map(|(&e, c)| (e, c.shape())).collect();
         let names: BTreeMap<u64, String> = codes.keys().map(|&e| (e, format!("f{e}"))).collect();
+        let block_addrs: BTreeMap<u64, Vec<u64>> = codes
+            .iter()
+            .map(|(&e, c)| {
+                (
+                    e,
+                    (0..c.blocks.len() as u64).map(|i| e * 0x1000 + i).collect(),
+                )
+            })
+            .collect();
         Program {
             // Deliberate collisions: equality must not depend on these hints.
             fps: codes.keys().map(|&e| (e, Fingerprint(0))).collect(),
@@ -1108,6 +1522,7 @@ mod tests {
             },
             names,
             codes,
+            block_addrs,
             shapes,
             stubs: BTreeSet::new(),
             incomplete: BTreeSet::new(),
@@ -1243,6 +1658,82 @@ mod tests {
             diff(&old, &new)
                 .iter()
                 .any(|m| matches!(m, Match::Changed { old: 1, new: 101 }))
+        );
+    }
+
+    #[test]
+    fn report_covers_every_match_kind_with_addresses() {
+        use biara_proto::diff::{BlockStatus, FunctionKind};
+        let same = code(1, None);
+        // A literal change keeps the structural match, so it is a change.
+        let mut changed = same.clone();
+        changed.blocks[0].0[0].inputs[1] = Atom::Constant(9, "I64".into());
+        // A different operation is a different shape: nothing to pair it with.
+        let shaped = |op: &str| {
+            let mut c = code(1, None);
+            c.blocks[0].0[0].name = op.into();
+            c
+        };
+        let old = program(vec![(1, same.clone()), (2, same), (3, shaped("add"))], true);
+        let new = program(
+            vec![(11, code(1, None)), (12, changed), (14, shaped("sub"))],
+            true,
+        );
+        // Remap names so (1,11) is same, (2,12) is changed, 3 is removed,
+        // 14 is added; report must expose every kind with guest addresses.
+        let mut new_named = new;
+        new_named.symbols =
+            BTreeMap::from([(11, "f1".into()), (12, "f2".into()), (14, "f14".into())]);
+        new_named.names.insert(11, "f1".into());
+        new_named.names.insert(12, "f2".into());
+        new_named.names.insert(14, "f14".into());
+        let matches = diff(&old, &new_named);
+        assert!(matches.iter().any(|m| matches!(m, Match::Same { .. })));
+        assert!(matches.iter().any(|m| matches!(m, Match::Changed { .. })));
+        assert!(matches.iter().any(|m| matches!(m, Match::Removed { .. })));
+        assert!(matches.iter().any(|m| matches!(m, Match::Added { .. })));
+        let report = report(&old, &new_named, &matches);
+        assert_eq!(report.functions.len(), matches.len());
+        for f in &report.functions {
+            match f.kind {
+                FunctionKind::Same => {
+                    assert_eq!(f.confidence, 1.0);
+                    assert!(!f.uncertain && f.reasons.is_empty());
+                    assert!(f.blocks.iter().all(|b| b.status == BlockStatus::Same));
+                }
+                FunctionKind::Changed => {
+                    assert_eq!(f.confidence, 1.0);
+                    assert!(!f.reasons.is_empty());
+                    assert!(f.blocks.iter().any(|b| b.status == BlockStatus::Changed));
+                }
+                FunctionKind::Added => {
+                    assert!(f.old_function.is_none() && f.new_function == Some(14));
+                    assert!(f.blocks.iter().all(|b| b.status == BlockStatus::Added));
+                    assert!(f.blocks.iter().all(|b| b.old_block.is_none()));
+                    assert_eq!(f.blocks.len(), 1);
+                }
+                FunctionKind::Removed => {
+                    assert!(f.new_function.is_none() && f.old_function == Some(3));
+                    assert!(f.blocks.iter().all(|b| b.status == BlockStatus::Removed));
+                    assert!(f.blocks.iter().all(|b| b.new_block.is_none()));
+                    assert_eq!(f.blocks.len(), 1);
+                }
+                FunctionKind::Uncertain => panic!("no uncertain pairing expected: {f:?}"),
+            }
+            assert!(f.old_name.is_some() || f.kind == FunctionKind::Added);
+            assert!(f.new_name.is_some() || f.kind == FunctionKind::Removed);
+        }
+        // Unknown entries cannot invent correspondences: they surface as an
+        // explicit issue, never a silent drop or a fabricated function row.
+        let mut bogus = matches.clone();
+        bogus.push(Match::Same { old: 999, new: 888 });
+        let bogus_report = super::report(&old, &new_named, &bogus);
+        assert_eq!(bogus_report.functions.len(), matches.len());
+        assert!(
+            bogus_report
+                .issues
+                .iter()
+                .any(|i| matches!(i, biara_proto::diff::DiffIssue::Inconsistent { .. }))
         );
     }
 }

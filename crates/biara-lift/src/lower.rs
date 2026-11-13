@@ -1228,10 +1228,11 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
             return Ok(f);
         }
         let params: Vec<BasicMetadataTypeEnum> = h
-            .params()
+            .params_vec()?
+            .into_iter()
             .map(|p| self.helper_type(p).map(Into::into))
             .collect::<R<_>>()?;
-        let fn_ty = match h.ret() {
+        let fn_ty = match h.ret()? {
             HelperType::Void => self.cx.void_type().fn_type(&params, false),
             t => self.helper_type(t)?.fn_type(&params, false),
         };
@@ -1273,7 +1274,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
         // i128 values travel as two i64 temps (low first).
         let mut args: Vec<BasicMetadataValueEnum> = Vec::with_capacity(inp.len());
         let mut i = 0;
-        for p in h.params() {
+        for p in h.params_vec()? {
             let take = if p == HelperType::I128 { 2 } else { 1 };
             let ts = inp
                 .get(i..i + take)
@@ -1297,7 +1298,9 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
                     .into(),
                 HelperType::I64 => self.fit(self.read(ts[0])?, self.i64(), false)?.into(),
                 HelperType::S64 => self.fit(self.read(ts[0])?, self.i64(), true)?.into(),
-                HelperType::Void => unreachable!(),
+                HelperType::Void => {
+                    return Err(self.unsupported("void helper parameter"));
+                }
             };
             args.push(v);
         }
@@ -1322,7 +1325,7 @@ impl<'a, 'ctx> Lowering<'a, 'ctx> {
         if writes && !h.no_return() && !h.preserves_globals() {
             self.sync_helper(op, false)?;
         }
-        match (h.ret(), r.try_as_basic_value()) {
+        match (h.ret()?, r.try_as_basic_value()) {
             (HelperType::Void, _) => {}
             (HelperType::I128, ValueKind::Basic(v)) => {
                 let (lo, hi) = self.split(v.into_int_value())?;

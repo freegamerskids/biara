@@ -84,12 +84,29 @@ BiaraLayouts *biara_layouts_build(LLVMModuleRef M, const struct BiaraCField *Cpu
 // offsets, bindings) are untouched. Returns 0 on success, 1 on failure
 // (exceptions never cross the native boundary).
 int biara_layouts_apply_debug(BiaraLayouts *L, LLVMModuleRef M);
+// Apply user-declared struct bindings: one entry per bound layout class,
+// each naming the declared struct plus its typed fields. Only the named
+// classes change (never shape-matched unrelated layouts); ids, sizes
+// (except asserted extra-field growth), offsets and bindings otherwise
+// stay. Returns the bound layout count, or -1 on failure (exceptions
+// never cross the native boundary).
+struct BiaraStructField {
+  int64_t off;
+  uint32_t bytes;
+  const char *name;
+  const char *type;
+};
+struct BiaraStruct {
+  const char *name;
+  const struct BiaraStructField *fields;
+  size_t nfields;
+};
+int biara_layouts_bind_structs(BiaraLayouts *L, const int *Classes, const struct BiaraStruct *Structs, size_t NBinds);
 // Export owned facts as one UTF-8 JSON object (see src/layouts.rs
 // `LayoutFacts` for field names). Small: layouts, bindings, conflicts,
 // status, and limits only; no per-instruction data. Returns 0 on success,
 // the first nonzero sink status otherwise.
 int biara_layouts_json(const BiaraLayouts *L, BiaraWrite Write, void *Ctx);
-void biara_layouts_free(BiaraLayouts *L);
 
 // Cached renderer: consumes the existing analysis without re-running it.
 // `L` must have been
@@ -148,6 +165,10 @@ struct Field {
   int Embed = -1;   // a struct of this class, in place (frames)
   std::string Name;
   bool Debug = false;
+  // User-asserted C type for this field (`""`: inferred only). When set
+  // by a struct binding, the renderer spells this type instead of the
+  // width-implied integer; provenance stays explicit (see export).
+  std::string Asserted;
 };
 
 struct Layout {
@@ -234,6 +255,10 @@ struct Types {
   std::string fieldTy(const Field &F);
   // DWARF display renames; returns renamed fields. Structural facts stay.
   size_t debugFrames(llvm::Module &M);
+  // User-declared struct bindings over shared layouts, applied per bound
+  // class only (never by shape). Returns bound layouts. Classes,
+  // bindings and ids stay.
+  int bindStructs(const std::vector<std::tuple<int, std::string, std::vector<Field>>> &Binds);
 };
 
 // Access the cached inference for rendering (the cgen.cpp `Emitter` holds

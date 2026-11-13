@@ -162,7 +162,10 @@ impl Cfg {
                         .collect();
                     handles
                         .into_iter()
-                        .map(|handle| handle.join().expect("block decoder panicked"))
+                        .map(|handle| match handle.join() {
+                            Ok(decoded) => decoded,
+                            Err(_) => Err(Error::Codec("block decoder panicked".into())),
+                        })
                         .collect::<Result<Vec<_>, Error>>()
                 })?;
                 for (&(&pc, _), block) in batch.iter().zip(decoded.into_iter().flatten()) {

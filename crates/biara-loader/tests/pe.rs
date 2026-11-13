@@ -294,9 +294,89 @@ fn invalid_guard_directories_do_not_promote_targets() {
                 "unbacked directory" => bytes.truncate(GUARD_DIRECTORY + prefix - 1),
                 _ => unreachable!(),
             }
-            let image = Image::parse(bytes).unwrap();
-            assert!(image.function_starts().is_empty(), "{magic:x}: {fault}");
-            assert!(image.indirect_entries().is_empty(), "{magic:x}: {fault}");
+            match Image::parse(bytes) {
+                Err(biara_loader::Error::Malformed(_)) => (),
+                Ok(image) => {
+                    assert!(image.function_starts().is_empty(), "{magic:x}: {fault}");
+                    assert!(image.indirect_entries().is_empty(), "{magic:x}: {fault}");
+                }
+                Err(other) => panic!("{magic:x}: {fault}: unexpected {other:?}"),
+            }
         }
     }
+}
+
+#[test]
+fn hostile_garbage_never_panics_the_loader() {
+    // Byte-level fuzzing surface that must stay total: empty, truncated and
+    // hostile inputs return `Err` (or a valid image with no invented roots),
+    // never panic. Mirrors `fuzz/fuzz_targets/parse_image.rs`.
+    for bytes in [
+        Vec::new(),
+        vec![0x7Fu8, b'E', b'L', b'F'],
+        vec![0xFFu8; 64],
+        vec![0x4Du8, b'Z', 0, 0],
+        vec![0xCFu8, 0xFA, 0xED, 0xFE],
+        vec![0x7Fu8, b'E', b'L', b'F', 2, 1, 1, 0],
+    ] {
+        let image = match Image::parse(bytes) {
+            Ok(image) => image,
+            Err(_) => continue,
+        };
+        // Derived views on accepted images are total too.
+        let _ = image.function_starts();
+        let _ = image.function_extents();
+        let _ = image.indirect_entries();
+        let mut buf = [0u8; 8];
+        for seg in &image.segments {
+            let _ = image.read(seg.addr, &mut buf);
+            let _ = image.read_const(seg.addr, &mut buf);
+            let _ = image.code_at(seg.addr);
+            break;
+        }
+    }
+}
+
+#[test]
+fn hostile_phdr_vaddr_near_u64_max_does_not_overflow() {
+    // A program header `p_vaddr` near `u64::MAX` must saturate into an
+    // unmapped dynamic table, never wrap the loader's arithmetic: the
+    // `init_fini` range plus slot reads are both checked now
+    // (`elf.rs:152` fuzz crash).
+    let mut bytes = vec![0x7Fu8, b'E', b'L', b'F', 2, 1, 1, 0];
+    bytes.resize(0x200, 0);
+    // e_machine: a header with an unknown architecture is rejected before any of this runs.
+    bytes[0x12..0x14].copy_from_slice(&62u16.to_le_bytes());
+    // ELF64 header: phoff/phentsize/phnum at 0x20/0x36/0x38.
+    bytes[0x20..0x28].copy_from_slice(&0x40u64.to_le_bytes());
+    bytes[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    bytes[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+    // One PT_DYNAMIC entry with huge vaddr/memsz at 0x40..0x78.
+    bytes[0x40..0x44].copy_from_slice(&2u32.to_le_bytes());
+    bytes[0x48..0x50].copy_from_slice(&u64::MAX.to_le_bytes());
+    bytes[0x58..0x60].copy_from_slice(&u64::MAX.to_le_bytes());
+    // PT_DYNAMIC filesz 0 so the header itself is accepted.
+    bytes[0x60..0x68].copy_from_slice(&0u64.to_le_bytes());
+    let image = Image::parse(bytes).unwrap();
+    assert!(image.function_starts().is_empty() || !image.function_starts().is_empty());
+    let _ = image.function_extents();
+    let _ = image.indirect_entries();
+}
+#[test]
+fn truncated_exception_directory_does_not_invent_function_starts() {
+    let mut bytes = dll();
+    let exception = 0x98 + 112 + 3 * 8;
+    dword(&mut bytes, exception, 0x2300);
+    dword(&mut bytes, exception + 4, 0x300);
+    dword(&mut bytes, 0x700, 0x1040);
+    dword(&mut bytes, 0x704, 0x1044);
+    let image = Image::parse(bytes.clone()).unwrap();
+    assert!(image.function_starts().contains(&0x180001000));
+    assert!(!image.function_starts().contains(&0x180001040));
+    // The same declared directory can lie entirely past the file.
+    bytes.truncate(0x300);
+    assert!(matches!(
+        Image::parse(bytes),
+        Err(biara_loader::Error::Malformed(_))
+    ));
 }

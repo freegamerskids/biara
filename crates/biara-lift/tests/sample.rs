@@ -12,7 +12,7 @@ mod common;
 
 use std::{ffi::CString, path::PathBuf, process::Command};
 
-use biara_lift::{ResolveOptions, host_machine, recover_resolving};
+use biara_lift::{ResolveOptions, analysis_machine, recover_resolving};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 use common::{corpus, linker, tmp};
@@ -170,7 +170,7 @@ fn sample() {
     let image = Image::load(&bin).unwrap();
     let shared = Libtcg::load(&Libtcg::find("x86_64").expect("libtcg"), None).unwrap();
     let mut lib = shared.lock();
-    let machine = host_machine().unwrap();
+    let machine = analysis_machine().unwrap();
     let discovery = biara_cfg::Discovery {
         code: image.code.clone(),
         extents: image.function_extents(),

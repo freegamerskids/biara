@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
 libtcg-sys = { path = "crates/libtcg-sys" }
@@ -16,6 +17,7 @@ biara-abi = { path = "crates/biara-abi" }
 biara-lift = { path = "crates/biara-lift" }
 biara-diff = { path = "crates/biara-diff" }
 biara-engine = { path = "crates/biara-engine" }
+biara-proto = { path = "crates/biara-proto" }
 
 anyhow = "1.0.104"
 bindgen = "0.73.2"
@@ -33,5 +35,17 @@ postcard = { version = "1", features = ["alloc", "use-std"] }
 blake3 = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 memmap2 = "0.9"
+zstd = "0.13"
+toml = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 # LLVM 23 support is on inkwell master only (0.10.0 stops at LLVM 22).
 inkwell = { git = "https://github.com/TheDan64/inkwell", rev = "5718b632ae689376f74ddfb4ff804a90eb7319f0", default-features = false, features = ["llvm23-1-force-static", "target-x86"] }
+
+# Rune (the UI toolkit behind biara-ui) ships patched copies of these crates; a
+# dependency's [patch] never reaches the workspace that uses it, so the workspace
+# repeats them from the same rev as the `rune` dependency. Keep the revs in step.
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "8e1ae9ae3a38e7a2013ce4d947870ffe5eebec08" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "8e1ae9ae3a38e7a2013ce4d947870ffe5eebec08" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "8e1ae9ae3a38e7a2013ce4d947870ffe5eebec08" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "8e1ae9ae3a38e7a2013ce4d947870ffe5eebec08" }

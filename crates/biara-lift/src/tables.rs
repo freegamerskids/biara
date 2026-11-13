@@ -587,18 +587,26 @@ struct CallbackTargets {
 
 fn callback_targets(
     sites: &mut CallSites<'_>,
-    roots: Vec<(u64, u64, Arg, usize)>,
+    mut roots: Vec<(u64, u64, Arg, usize)>,
     read: Reader<'_>,
 ) -> Result<CallbackTargets, Error> {
-    let mut out = CallbackTargets::default();
+    let mut out = CallbackTargets {
+        limited: roots.len() > 4096,
+        ..Default::default()
+    };
+    roots.truncate(4096);
     let mut work: VecDeque<_> = roots.into();
     let mut seen = HashSet::new();
     while let Some((site, at, arg, depth)) = work.pop_front() {
-        if !seen.insert((site, at, arg.clone())) {
+        if depth >= 16 {
+            out.limited = true;
             continue;
         }
-        if depth >= 16 || seen.len() > 4096 {
+        if seen.len() == 4096 {
             out.limited = true;
+            break;
+        }
+        if !seen.insert((site, at, arg.clone())) {
             continue;
         }
         let function_pointer = depth > 0 || internal_result(&arg);
@@ -671,6 +679,10 @@ fn callback_targets(
             .iter()
             .filter(|c| matches!(c.callee, Callee::Function(f) if f == at))
         {
+            if seen.len() + work.len() >= 4096 {
+                out.limited = true;
+                break;
+            }
             work.push_back((
                 site,
                 call.caller,
@@ -679,7 +691,7 @@ fn callback_targets(
             ));
         }
     }
-    out.limited |= sites.memory_limited();
+    out.limited |= sites.analysis_limited();
     Ok(out)
 }
 

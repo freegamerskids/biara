@@ -180,6 +180,55 @@ fn small_budget_and_entry_selection_do_not_poison_later_recovery() {
 }
 
 #[test]
+fn minimum_memory_budget_recovers_calls_and_rejects_smaller_limits() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("engine-minimum-memory");
+    let binary = build(&dir, 3, 1);
+    let image = Image::load(&binary).unwrap();
+    let database = dir.join(format!("analysis-{}.sqlite", std::process::id()));
+    let invoke = |memory: &str| {
+        Command::new(env!("CARGO_BIN_EXE_biara"))
+            .arg("lift")
+            .arg(&binary)
+            .arg("other")
+            .args([
+                "--emit",
+                "cfg",
+                "--format",
+                "json",
+                "--jobs",
+                "16",
+                "--memory-mib",
+                memory,
+            ])
+            .arg("--database")
+            .arg(&database)
+            .output()
+            .unwrap()
+    };
+    let rejected = invoke("2047");
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(!database.exists());
+    let recovered = invoke("2048");
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let report: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    let functions = report["analysis"]["functions"].as_array().unwrap();
+    let other = image.symbol("other").unwrap().addr;
+    let leaf = image.symbol("leaf").unwrap().addr;
+    let caller = functions.iter().find(|f| f["address"] == other).unwrap();
+    assert_eq!(caller["calls"], serde_json::json!([leaf]));
+    assert!(functions.iter().any(|f| f["address"] == leaf));
+    assert_eq!(
+        report["completeness"]["recovery"]["block_limit_reached"],
+        false
+    );
+}
+
+#[test]
 fn database_failure_is_not_reported_as_successful_partial_recovery() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("engine-database-error");
     let binary = build(&dir, 3, 1);

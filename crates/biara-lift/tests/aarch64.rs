@@ -20,7 +20,7 @@ use std::{
 use common::corpus::{self, *};
 
 use biara_cfg::Cfg;
-use biara_lift::{RUN, ResolveOptions, host_machine, lift, optimize, recover_resolving};
+use biara_lift::{RUN, ResolveOptions, analysis_machine, lift, optimize, recover_resolving};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 use inkwell::{OptimizationLevel, context::Context};
@@ -61,7 +61,7 @@ impl Corpus {
     fn recover(&self, lib: &mut Libtcg, entries: &[u64]) -> Cfg {
         let cfg = recover_resolving(
             lib,
-            &host_machine().unwrap(),
+            &analysis_machine().unwrap(),
             &|pc| self.image.code_at(pc),
             &|addr, buf| self.image.read_const(addr, buf),
             entries,
@@ -105,7 +105,7 @@ fn check(name: &str, reference: Ref) {
 
         let env = lib.env();
         let pristine = unsafe { std::slice::from_raw_parts(env, info.env_size) }.to_vec();
-        let machine = host_machine().unwrap();
+        let machine = analysis_machine().unwrap();
 
         // Plain lifting, and trusting the recovered calling conventions.
         let abis = biara_abi::analyze(&cfg, &info).unwrap();
@@ -116,7 +116,7 @@ fn check(name: &str, reference: Ref) {
                 optimize(&module, &machine, jit).unwrap();
             }
             let ee = module
-                .create_jit_execution_engine(OptimizationLevel::None)
+                .create_jit_execution_engine /* native JIT: module under test was lifted with analysis_machine */(OptimizationLevel::None)
                 .unwrap();
             for h in cfg.helpers() {
                 if let Some(decl) = module.get_function(&h.symbol()) {

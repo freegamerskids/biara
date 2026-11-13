@@ -7,14 +7,13 @@ mod common;
 use std::{collections::BTreeSet, process::Command};
 
 use biara_lift::{
-    Arg, CallSites, SizeRange,
+    Arg, CallSites, SizeRange, analysis_machine,
     audit::{
         Input, Issue, audit,
         object::{
             ObjectBound, ObjectEvidence, ObjectOrigin, ObjectQuery, UnknownExtent, pointer_facts,
         },
     },
-    host_machine,
 };
 use biara_loader::Image;
 use biara_tcg::Libtcg;
@@ -110,7 +109,7 @@ fn binary_object_bounds_and_return_aliases() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let machine = host_machine().unwrap();
+    let machine = analysis_machine().unwrap();
     let lib = Libtcg::load(&Libtcg::find("x86_64").expect("libtcg"), None).unwrap();
     let mut lib = lib.lock();
     for (path, has_debug) in [(&debug, true), (&stripped, false)] {

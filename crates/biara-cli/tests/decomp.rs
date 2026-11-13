@@ -9,7 +9,8 @@ use std::{
 };
 
 fn fixture(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let dir =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let source = dir.join("program.c");
     let binary = dir.join("program");
@@ -348,4 +349,224 @@ fn jobs_preserves_gate_and_sink_failures() {
         &["--format", "json", "-o", "/dev/full", "--jobs", "16"],
     );
     assert!(!failed.status.success());
+}
+
+#[test]
+fn semantic_tokens_address_the_complete_body_in_json_and_jsonl() {
+    use biara_proto::tokens::{SymbolRef, Token, substitute};
+    use std::collections::BTreeMap;
+
+    let binary = fixture("decomp-semantic-tokens");
+    let image = Image::load(&binary).unwrap();
+    let target = image.symbol("target").unwrap().addr;
+    let leaf = image.symbol("leaf").unwrap().addr;
+    let check_addresses = |header: &Value| {
+        let symbols: biara_proto::PackageSymbols =
+            serde_json::from_value(header["symbols"].clone()).unwrap();
+        for function in symbols.functions {
+            assert!(
+                image.code_at(function.address).is_some(),
+                "{} has no guest code at {:#x}",
+                function.text,
+                function.address
+            );
+        }
+    };
+    for format in ["json", "jsonl"] {
+        let output = run(
+            &binary,
+            &["target", "message"],
+            &[
+                "--format",
+                format,
+                "--chunk-lines",
+                "3",
+                "--context-depth",
+                "1",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (header, text) = if format == "json" {
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            for record in report["functions"].as_array().unwrap() {
+                check_addresses(&record["function"]);
+            }
+            let record = report["functions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["function"]["address"] == target)
+                .unwrap();
+            (record["function"].clone(), body(record))
+        } else {
+            let records: Vec<Value> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            for record in records.iter().filter(|r| r["record"] == "function") {
+                check_addresses(&record["function"]);
+            }
+            let record = records
+                .iter()
+                .find(|r| r["record"] == "function" && r["function"]["address"] == target)
+                .unwrap();
+            let text = records
+                .iter()
+                .filter(|r| r["record"] == "chunk" && r["function_address"] == target)
+                .map(|r| r["chunk"]["text"].as_str().unwrap())
+                .collect::<String>();
+            (record["function"].clone(), text)
+        };
+        let tokens: Vec<Token> = serde_json::from_value(header["tokens"].clone()).unwrap();
+        let symbols: biara_proto::PackageSymbols =
+            serde_json::from_value(header["symbols"].clone()).unwrap();
+        let callee = symbols
+            .functions
+            .iter()
+            .find(|f| f.address == leaf)
+            .unwrap();
+        let key = SymbolRef::Function { address: leaf };
+        let mut offset = 0;
+        let mut expected = String::new();
+        let mut call_found = false;
+        for token in &tokens {
+            assert_eq!(token.start, offset);
+            assert!(token.end > token.start);
+            let span = &text[token.start as usize..token.end as usize];
+            if token.symbol.as_ref() == Some(&key) {
+                assert_eq!(span, callee.text);
+                expected.push_str("renamed_leaf");
+                call_found = true;
+            } else {
+                expected.push_str(span);
+            }
+            offset = token.end;
+        }
+        assert_eq!(offset as usize, text.len());
+        assert!(call_found, "missing callee identity in {format}");
+        assert_eq!(
+            substitute(
+                &text,
+                &tokens,
+                &BTreeMap::from([(key, "renamed_leaf".into())])
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn signed_annotations_preserve_unsigned_guest_arithmetic() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("decomp-signed-arithmetic-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("program.c");
+    let binary = dir.join("program");
+    fs::write(
+        &source,
+        r#"
+#include <stdint.h>
+__attribute__((noinline,used)) uint64_t logical(uint64_t x) { return x >> 1; }
+__attribute__((noinline,used)) uint64_t wrapping(uint64_t x) { return x + 1; }
+__attribute__((noinline,used)) int16_t narrow(int16_t x) { return x - 300; }
+int main(void) { return 0; }
+"#,
+    )
+    .unwrap();
+    let built = Command::new(env!("BIARA_CLANG"))
+        .args(["-O2", "-fno-pie", "-no-pie", "-fuse-ld=bfd"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let image = Image::load(&binary).unwrap();
+    let mut functions = serde_json::Map::new();
+    for (name, signature) in [
+        ("logical", "int64_t logical(int64_t)"),
+        ("wrapping", "int64_t wrapping(int64_t)"),
+        ("narrow", "int16_t narrow(int16_t)"),
+    ] {
+        functions.insert(
+            image.symbol(name).unwrap().addr.to_string(),
+            serde_json::json!({"signature": signature}),
+        );
+    }
+    let annotations = dir.join("annotations.json");
+    fs::write(
+        &annotations,
+        serde_json::to_vec(&serde_json::json!({"version": 1, "functions": functions})).unwrap(),
+    )
+    .unwrap();
+    let report = report(run(
+        &binary,
+        &["logical", "wrapping", "narrow"],
+        &[
+            "--format",
+            "json",
+            "--annotations",
+            annotations.to_str().unwrap(),
+        ],
+    ));
+    let recovered: String = report["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(body)
+        .collect();
+    let consumer = dir.join("consumer.c");
+    fs::write(
+        &consumer,
+        format!(
+            r#"
+#include <stdint.h>
+#include <limits.h>
+{recovered}
+int main(void) {{
+    if ((uint64_t)logical(-2) != UINT64_C(0x7fffffffffffffff)) return 1;
+    if (wrapping(INT64_MAX) != INT64_MIN) return 2;
+    if (wrapping(-1) != 0) return 3;
+    for (int32_t x = INT16_MIN; x <= INT16_MAX; ++x)
+        if (narrow((int16_t)x) != (int16_t)(x - 300)) return 4;
+    return 0;
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let executable = dir.join("consumer");
+    let compiled = Command::new(env!("BIARA_CLANG"))
+        .args([
+            "-O2",
+            "-fsanitize=undefined",
+            "-fno-sanitize-recover=undefined",
+        ])
+        .arg(&consumer)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let result = Command::new(executable).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{:?}: {}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stderr)
+    );
 }

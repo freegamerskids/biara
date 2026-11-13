@@ -4,8 +4,10 @@ description = "Persistent, process-isolated binary recovery engine"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
+biara-proto.workspace = true
 biara-tcg.workspace = true
 biara-loader.workspace = true
 biara-cfg.workspace = true
@@ -18,4 +20,5 @@ postcard.workspace = true
 blake3.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
+zstd.workspace = true
 libc.workspace = true

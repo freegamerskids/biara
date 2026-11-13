@@ -128,6 +128,17 @@ std::string jsonStr(StringRef S) {
 
 // Guest entry address: `!biara.entry !{i64 entry}` attached by Rust from the
 // compact summaries. Only carriers are packaged in Mode 1.
+// Guest address of a declared callee: `!biara.callee !{i64 entry}`. Only the symbol table
+// uses it; a declaration is never emitted as a definition.
+std::optional<uint64_t> calleeOf(const Function &Fn, LLVMContext &Cx) {
+  MDNode *N = Fn.getMetadata(Cx.getMDKindID("biara.callee"));
+  if (!N || !N->getNumOperands())
+    return std::nullopt;
+  if (auto *C = mdconst::dyn_extract<ConstantInt>(N->getOperand(0)))
+    return C->getZExtValue();
+  return std::nullopt;
+}
+
 std::optional<uint64_t> entryOf(const Function &Fn, LLVMContext &Cx) {
   MDNode *N = Fn.getMetadata(Cx.getMDKindID("biara.entry"));
   if (!N || !N->getNumOperands())
@@ -455,8 +466,21 @@ class Emitter {
   std::map<uint64_t, std::string> Syms;    // function names, by entry address
   bool Posix = false;
   std::map<std::string, BiaraProto> Protos; // typed import declarations, by name
-
-  // Per function.
+  // Authoritative emitted-symbol registry (C3): every nonlocal entity the
+  // renderer emits, keyed by emitted spelling. Functions/globals map to
+  // their guest/image address; types map to their layout-analysis shared
+  // id. Locals/parameters may reuse any spelling (they are renamed on
+  // collision via Taken/GlobalNames); only registry hits are rename
+  // targets, so shadowing locals never misattribute.
+  std::map<std::string, uint64_t> EmittedFunctions; // emitted name -> entry
+  std::map<std::string, uint64_t> EmittedGlobals;   // emitted name -> image addr
+  std::map<std::string, uint32_t> EmittedTypes;     // emitted name -> layout id
+  // Declared formal/return C spellings (C4) are read per use from the
+  // `biara.c_type` / `biara.c_return` attributes (see declaredParam /
+  // declaredReturn): no per-function copies, so stale spellings cannot
+  // leak across functions.
+  // Per-statement record JSON rebuilt for each packaged function body.
+  std::string StatementJson;
   Function *F = nullptr;
   std::map<const Value *, std::string> Names;
   std::map<const Value *, std::string> Originals; // architectural/register hint kept
@@ -471,10 +495,8 @@ class Emitter {
   std::map<BasicBlock *, unsigned> Order;
   std::set<BasicBlock *> Targeted;
   std::map<const Value *, std::string> NameEvidence;
-  std::string StatementJson;
   uint64_t StatementCount = 0, MappedCount = 0, MaxDepth = 0, TempCount = 0;
   bool Packaging = false;
-
 public:
   Emitter(Module &M, biara_layouts::Types &T, size_t &Unsupported, std::vector<std::string> ConvArgs,
           uint64_t Margin, std::vector<BiaraData> Data, std::vector<BiaraStr> Strings,
@@ -653,6 +675,46 @@ public:
       }
     return cty(CB.getType());
   }
+  // Declared C spelling of ABI-formal `i` of `Fn` (`biara.c_type` string
+  // attribute, attached by ScalarTypes after the ABI form), or empty when
+  // the lane carries no declaration. Values are canonical faithful C
+  // (`int16_t`, `_Bool`, `struct Header *`, ...); transport stays
+  // sign-agnostic underneath.
+  static std::string declaredParam(Function &Fn, unsigned I) {
+    if (I >= Fn.arg_size()) return "";
+    Attribute A = Fn.getAttributes().getParamAttr(I, "biara.c_type");
+    if (!A.isStringAttribute()) return "";
+    return A.getValueAsString().str();
+  }
+  // Declared C return spelling (`biara.c_return` function string
+  // attribute), or empty when undeclared.
+  static std::string declaredReturn(Function &Fn) {
+    Attribute A = Fn.getAttributes().getFnAttr("biara.c_return");
+    if (!A.isStringAttribute()) return "";
+    return A.getValueAsString().str();
+  }
+  // lowering that must preserve LLVM bit-pattern operations converts
+  // explicitly at the boundary rather than changing the operation.
+  static bool declaredSigned(const std::string &S) {
+    StringRef T = StringRef(S).trim();
+    if (T == "int8_t" || T == "int16_t" || T == "int32_t" || T == "int64_t" ||
+        T == "biara_i128" || T == "int" || T == "signed" || T == "signed int" ||
+        T == "short" || T == "signed short" || T == "short int" ||
+        T == "long" || T == "signed long" || T == "long int" ||
+        T == "long long" || T == "signed long long" || T == "char" ||
+        T == "signed char")
+      return true;
+    return false;
+  }
+  // The declared C type of an ABI-formal argument value, or its
+  // transport type when undeclared.
+  std::string declaredArgTy(Argument *A) {
+    Function *P = A->getParent();
+    if (!P) return ctyOf(A);
+    std::string D = declaredParam(*P, A->getArgNo());
+    if (D.empty()) return ctyOf(A);
+    return D;
+  }
 
   std::string cty(Type *Ty) {
     if (Ty->isVoidTy())
@@ -691,10 +753,16 @@ public:
     ++Unsupported;
     return "uint64_t /* unsupported type */";
   }
-
   // C type of a value: pointer variables are typed by their class.
+  // ABI-formal arguments with a declared `biara.c_type` spell that type:
+  // signed/unsigned/bool/float/struct-pointer declarations flow into the
+  // signature and every use of the parameter value.
   std::string ctyOf(Value *V) {
-    if (auto It=CallbackTypes.find(V); It!=CallbackTypes.end()) return It->second;
+    if (auto *A = dyn_cast<Argument>(V)) {
+      if (auto It=CallbackTypes.find(V); It!=CallbackTypes.end()) return It->second;
+      std::string D = declaredParam(*A->getParent(), A->getArgNo());
+      if (!D.empty()) return D;
+    } else if (auto It=CallbackTypes.find(V); It!=CallbackTypes.end()) return It->second;
     if (V->getType()->isIntegerTy(64) || V->getType()->isPointerTy()) {
       int C = T.classOf(V);
       if (C >= 0 && T.Layouts.count(C) && (isa<Argument>(V) || isa<LoadInst>(V) ||
@@ -761,13 +829,23 @@ public:
   std::string name(const Value *V) { return Names.at(V); }
 
   void declareName(const Value *V, StringRef Hint) {
+    // Locals/parameters reserve against BOTH the global function/type
+    // namespace AND the authoritative emitted-symbol registry: a local
+    // spelling that equals an emitted function/global/type name is
+    // suffixed (`helper_1`), so emitted spellings stay globally unique
+    // nonlocal names and true scope is trivially decidable downstream.
     std::string Base = Hint.empty() ? "value" : ident(Hint);
     std::string N = Base;
-    if (Taken.count(N) || GlobalNames.count(N)) {
+    auto collides = [&](const std::string &C) {
+      return Taken.count(C) || GlobalNames.count(C) ||
+             EmittedFunctions.count(C) || EmittedGlobals.count(C) ||
+             EmittedTypes.count(C);
+    };
+    if (collides(N)) {
       auto [It, New] = NextSuffix.try_emplace(Base, 1);
       do {
         N = Base + "_" + std::to_string(It->second++);
-      } while (Taken.count(N) || GlobalNames.count(N));
+      } while (collides(N));
     }
     Taken.insert(N);
     Names[V] = N;
@@ -926,6 +1004,14 @@ public:
   }
 
   std::string sval(Value *V) {
+    // A declared signed ABI-formal reads in its declared type directly:
+    // the value already carries that C type, so no extra cast is needed
+    // (and adding one would change overload/idiom, not semantics).
+    // Unsigned/bool/float/pointer formals fall through to transport casts.
+    if (auto *A = dyn_cast<Argument>(V)) {
+      std::string D = declaredParam(*A->getParent(), A->getArgNo());
+      if (!D.empty() && declaredSigned(D)) return val(V);
+    }
     unsigned Bits = V->getType()->getIntegerBitWidth();
     // A folded truncation is one signed cast (`(int32_t)rdi`, not
     // `(int32_t)((uint32_t)rdi)`); of a constant, its value (`2`, not
@@ -950,7 +1036,6 @@ public:
     Helpers.try_emplace("sext", false);
     return "biara_sext(" + E + ", " + std::to_string(Bits) + ")";
   }
-
   // `E` reduced to `Bits` (after arithmetic that may leave the width).
   std::string wrap(const std::string &E, unsigned Bits) {
     if (Bits == 1)
@@ -1073,9 +1158,11 @@ public:
       return "0";
     return conv(val(V), ctyOf(V), To);
   }
-
-  // `V` as an integer (pointer variables converted back).
-  std::string ival(Value *V) { return valAs(V, cty(V->getType())); }
+  // Integer operations use LLVM's unsigned bit transport, even when
+  // a formal has a declared signed or pointer C type.
+  std::string ival(Value *V) {
+    return valAs(V, cty(V->getType()));
+  }
 
   std::string intrinsicFn(StringRef Base, unsigned Bits) {
     std::string N = ("biara_" + Base + std::to_string(Bits)).str();
@@ -1233,6 +1320,7 @@ public:
     if (auto *Bin = dyn_cast<BinaryOperator>(I)) {
       unsigned Bits = I->getType()->getIntegerBitWidth();
       Value *A = Bin->getOperand(0), *B = Bin->getOperand(1);
+      // Declared C types do not change LLVM's unsigned transport arithmetic.
       std::string X = ival(A), Y = ival(B);
       std::string Wide = Bits < 32 ? "(uint32_t)" : "";
       auto *K = dyn_cast<ConstantInt>(B);
@@ -2124,7 +2212,12 @@ public:
       if (!P->Count) S += "void";
       return S + ")";
     }
-    std::string S = cty(Fn.getReturnType()) + " " + fnName(Fn) + "(";
+    // Declared return spelling (`biara.c_return`) or transport type.
+    // A declared `_Bool` return is a real boolean (transport i1); `void`
+    // stays `void`; anything else the attribute carries verbatim.
+    std::string Ret = declaredReturn(Fn);
+    if (Ret.empty()) Ret = cty(Fn.getReturnType());
+    std::string S = Ret + " " + fnName(Fn) + "(";
     // Imports with a recovered shape: `const char *` where strings go,
     // `uint64_t` elsewhere, `, ...` when calls vary in count.
     if (Fn.isDeclaration())
@@ -2143,6 +2236,10 @@ public:
       return S + (unknownArity(Fn) ? "uint64_t, ...)" : "void)");
     for (unsigned K = 0; K < Fn.arg_size(); ++K) {
       Argument *A = Fn.getArg(K);
+      // Declared formal types spell faithfully (`int16_t`, `_Bool`,
+      // `struct Header *`); undeclared lanes keep transport types.
+      // `ctyOf` already prefers the declaration for definitions, so
+      // signature and body share one spelling.
       S += (K ? ", " : "") + (Fn.isDeclaration() ? cty(A->getType()) : ctyOf(A) + (WithNames ? " " + name(A) : ""));
     }
     if (Fn.isVarArg())
@@ -2582,7 +2679,6 @@ public:
     SupportDefs["biara_i128"]="typedef __int128 biara_i128;\n";
     for (Function &Fn : M)
       if (!Fn.isIntrinsic()) GlobalNames.insert(fnName(Fn));
-    GlobalNames.insert("biara_cpu");
     bool Selected = false;
     for (Function &Fn : M)
       Selected |= Fn.getMetadata("biara.present") != nullptr;
@@ -2591,6 +2687,54 @@ public:
       if (!Fn.isDeclaration() && !Fn.isIntrinsic() && entryOf(Fn,M.getContext()) &&
           (!Selected || presentOf(Fn,M.getContext())))
         Functions.push_back(&Fn);
+    // Authoritative registry: emitted (sanitized) nonlocal spellings with
+    // true identity. Functions by guest entry, data globals by image
+    // address, layout types by shared id. Locals collide-suffix against
+    // this (see declareName), so registry spellings are globally unique
+    // nonlocal names: every hit below is a genuine symbol, never a
+    // shadowed local, member field, literal, comment, or string.
+    EmittedFunctions.clear();
+    EmittedGlobals.clear();
+    EmittedTypes.clear();
+    // Imports and support routines without guest-entry metadata have no
+    // address identity; do not alias all of them to a fabricated address 0.
+    for (Function &Fn : M) {
+      if (Fn.isIntrinsic()) continue;
+      if (auto E = entryOf(Fn, M.getContext()))
+        EmittedFunctions.try_emplace(fnName(Fn), *E);
+      else if (auto C = calleeOf(Fn, M.getContext()))
+        EmittedFunctions.try_emplace(fnName(Fn), *C);
+    }
+    for (const BiaraData &D : Data)
+      EmittedGlobals.try_emplace(ident(D.name), D.addr);
+    // Layout shared ids: one id per printed structure name (same
+    // convention as the layout export: first class per unique name wins).
+    {
+      std::map<std::string, uint32_t> IdByName;
+      std::vector<std::pair<int, const biara_layouts::Layout *>> Sorted;
+      for (auto &[C, Lt] : T.Layouts) Sorted.push_back({C, &Lt});
+      std::sort(Sorted.begin(), Sorted.end(), [](auto &A, auto &B) {
+        if (A.second->Name != B.second->Name) return A.second->Name < B.second->Name;
+        return A.first < B.first;
+      });
+      for (auto &[C, Lt] : Sorted) {
+        auto [It, New] = IdByName.try_emplace(Lt->Name, (uint32_t)IdByName.size());
+        (void)C;
+        if (StringRef(Lt->Name).starts_with("struct ")) {
+          std::string Short = StringRef(Lt->Name).drop_front(7).str();
+          if (New) EmittedTypes.try_emplace(Short, It->second);
+        }
+      }
+      for (auto &[R, Lt] : T.Frames) {
+        (void)R;
+        if (StringRef(Lt.Name).starts_with("struct ")) {
+          std::string Short = StringRef(Lt.Name).drop_front(7).str();
+          auto F = IdByName.find(Lt.Name);
+          uint32_t Id = F == IdByName.end() ? (uint32_t)IdByName.size() : F->second;
+          EmittedTypes.try_emplace(Short, Id);
+        }
+      }
+    }
     std::stable_sort(Functions.begin(), Functions.end(), [&](Function *A, Function *B) {
       if (Selected)
         return *presentOf(*A,M.getContext()) < *presentOf(*B,M.getContext());
@@ -2704,7 +2848,49 @@ public:
       std::string Json="{\"address\":" + std::to_string(*entryOf(*Fn,M.getContext())) +
         ",\"name\":" + jsonStr(fnName(*Fn)) + ",\"signature\":" + jsonStr(Sig) +
         ",\"body\":" + jsonStr(Body) + ",\"statements\":" + StatementJson +
-        ",\"dependencies\":" + Deps + ",\"names\":" + NameJson + ",\"metrics\":" + Metrics + "}";
+        ",\"dependencies\":" + Deps + ",\"names\":" + NameJson + ",\"metrics\":" + Metrics;
+      // Authoritative native symbol table (C3): emitted nonlocal spellings
+      // with true identity for this record. `functions`/`globals` carry
+      // guest/image addresses; `types` carry layout shared ids scoped to
+      // this record's module (same ids as the layout export). The Rust
+      // lexer resolves tokens against this table only: declarations,
+      // plain global loads, address uses, calls/function values,
+      // casts/type uses all attribute; member-field sides, locals,
+      // parameters, keywords, numbers, comments and strings never do.
+      // Locals were uniquified against this table at emission, so every
+      // table hit is a genuine symbol.
+      Json += ",\"symbols\":{\"functions\":[";
+      {
+        bool FF = true;
+        for (auto &[Spelling, Addr] : EmittedFunctions) {
+          if (!Text.Identifiers.count(Spelling)) continue;
+          Json += (FF ? "" : ",") + std::string("{\"text\":") + jsonStr(Spelling) +
+                  ",\"address\":" + std::to_string(Addr) + "}";
+          FF = false;
+        }
+      }
+      Json += "],\"globals\":[";
+      {
+        bool FF = true;
+        for (auto &[Spelling, Addr] : EmittedGlobals) {
+          if (!Text.Identifiers.count(Spelling)) continue;
+          Json += (FF ? "" : ",") + std::string("{\"text\":") + jsonStr(Spelling) +
+                  ",\"address\":" + std::to_string(Addr) + "}";
+          FF = false;
+        }
+      }
+      Json += "],\"types\":[";
+      {
+        bool FF = true;
+        for (auto &[Spelling, Id] : EmittedTypes) {
+          if (!Text.Identifiers.count(Spelling)) continue;
+          Json += (FF ? "" : ",") + std::string("{\"text\":") + jsonStr(Spelling) +
+                  ",\"layout\":" + std::to_string(Id) + "}";
+          FF = false;
+        }
+      }
+      Json += "]}";
+      Json += "}";
       int Status=Write(Ctx,Json.data(),Json.size());
       if (Status) return Status;
     }
@@ -2717,6 +2903,9 @@ public:
       if (!Fn.isIntrinsic())
         GlobalNames.insert(fnName(Fn));
     GlobalNames.insert("biara_cpu");
+    // Data globals reserve too: a local spelling that equals an emitted
+    // data name is suffixed, so executable-C names stay unique as well.
+    for (const BiaraData &D : Data) GlobalNames.insert(ident(D.name));
     if (!Out.write("/*\n * ") || !Out.write(Banner) ||
         !Out.write("\n */\n\n#include <stdbool.h>\n#include <stdint.h>\n\n"
                    "typedef unsigned __int128 biara_u128;\n"

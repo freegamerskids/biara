@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /*
  * libtcg: QEMU's TCG frontend exposed as a library.
  *

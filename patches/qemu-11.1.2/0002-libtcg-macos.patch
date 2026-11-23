@@ -1,6 +1,6 @@
 diff -r a/common-user/meson.build b/common-user/meson.build
---- a/common-user/meson.build	2026-11-23 21:59:38.053842886 +0100
-+++ b/common-user/meson.build	2026-11-23 21:59:38.055397335 +0100
+--- a/common-user/meson.build	2026-11-23 22:11:07.218186334 +0100
++++ b/common-user/meson.build	2026-11-23 22:11:07.220751998 +0100
 @@ -4,6 +4,10 @@
  
  common_user_inc += include_directories('host/' / host_arch)
@@ -13,8 +13,8 @@ diff -r a/common-user/meson.build b/common-user/meson.build
    'mmap-min-addr.c',
    'probe-guest-base.c',
 diff -r a/configure b/configure
---- a/configure	2026-11-23 21:59:38.052050138 +0100
-+++ b/configure	2026-11-23 21:59:38.055486223 +0100
+--- a/configure	2026-11-23 22:11:07.216716438 +0100
++++ b/configure	2026-11-23 22:11:07.220868459 +0100
 @@ -793,7 +793,9 @@
      if [ "$linux_user" != no ]; then
          if [ "$host_os" = linux ]; then
@@ -27,8 +27,8 @@ diff -r a/configure b/configure
          fi
          if [ "$linux_user" = "yes" ]; then
 diff -r a/linux-user/meson.build b/linux-user/meson.build
---- a/linux-user/meson.build	2026-11-23 21:59:38.053288136 +0100
-+++ b/linux-user/meson.build	2026-11-23 21:59:38.055553554 +0100
+--- a/linux-user/meson.build	2026-11-23 22:11:07.217737095 +0100
++++ b/linux-user/meson.build	2026-11-23 22:11:07.220942177 +0100
 @@ -59,4 +59,6 @@
  subdir('x86_64')
  subdir('xtensa')
@@ -37,9 +37,25 @@ diff -r a/linux-user/meson.build b/linux-user/meson.build
 +if host_os == 'linux'
 +  specific_ss.add_all(when: 'CONFIG_LINUX_USER', if_true: linux_user_ss)
 +endif
+diff -r a/linux-user/syscall_defs.h b/linux-user/syscall_defs.h
+--- a/linux-user/syscall_defs.h	2026-11-23 22:11:07.218602428 +0100
++++ b/linux-user/syscall_defs.h	2026-11-23 22:11:07.233277395 +0100
+@@ -9,7 +9,12 @@
+ 
+ #include "syscall_nr.h"
+ 
++#ifdef __APPLE__
++/* <sys/cdefs.h> defines __unused; the target structs use it as a field name. */
++#undef __unused
++#endif
+ 
++
+ /* socket operations for socketcall() */
+ #define TARGET_SYS_SOCKET       1         /* socket()              */
+ #define TARGET_SYS_BIND         2         /* bind()                */
 diff -r a/meson.build b/meson.build
---- a/meson.build	2026-11-23 21:59:38.052677105 +0100
-+++ b/meson.build	2026-11-23 21:59:38.064730053 +0100
+--- a/meson.build	2026-11-23 22:11:07.217252077 +0100
++++ b/meson.build	2026-11-23 22:11:07.222167982 +0100
 @@ -3286,7 +3286,7 @@
  foreach target : target_dirs
    config_target = { 'TARGET_NAME': target.split('-')[0] }

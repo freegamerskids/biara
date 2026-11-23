@@ -4,7 +4,8 @@ The rest of this repository is MIT (see `../LICENSE`). Everything in this direct
 
 `qemu-11.1.2/0001-libtcg.patch` modifies QEMU source files (`accel/tcg/translator.c`,
 `include/exec/translator.h`, `meson.build`); `qemu-11.1.2/0002-libtcg-macos.patch` modifies
-`configure`, `meson.build`, `linux-user/meson.build` and `common-user/meson.build` so the
+`configure`, `meson.build`, `linux-user/meson.build`, `linux-user/syscall_defs.h` and
+`common-user/meson.build` so the
 linux-user targets' translator builds on macOS. QEMU is licensed under the GNU GPL, version 2 or
 (for these files) any later version, and a modification of those files is a derivative work
 under the same terms. The patches are therefore **GPL-2.0-or-later**, not MIT. QEMU's own license

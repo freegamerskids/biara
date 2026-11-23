@@ -65,8 +65,11 @@ jobs:
       - name: Diagnose the link (temporary)
         if: failure()
         run: |
-          vm_stat | head -5
-          cargo build -p biara-cli -j1 --locked 2>&1 | tail -30 || true
-          cargo rustc -p biara-cli --bin biara --locked -- -C link-arg=-Wl,-v 2>&1 | tail -40 || true
+          echo "=== cc -v link"
+          cargo rustc -p biara-cli --bin biara --locked -- -C link-arg=-v 2>&1 | tail -60 || true
+          echo "=== ld64.lld"
+          RUSTFLAGS="-C link-arg=--ld-path=$PWD/.deps/llvm-23.1.2/bin/ld64.lld" \
+            cargo build -p biara-cli --locked 2>&1 | tail -40 || true
+          echo "=== done"
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast

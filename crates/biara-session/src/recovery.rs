@@ -217,7 +217,7 @@ pub fn find_libtcg(arch: &str) -> anyhow::Result<PathBuf> {
     if let Ok(p) = Libtcg::find(arch) {
         return Ok(p);
     }
-    let name = format!("libtcg-{arch}.so");
+    let name = Libtcg::file_name(arch);
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(dir) = std::env::current_exe()
         .ok()

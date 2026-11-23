@@ -1,13 +1,14 @@
 name: Toolchain
 description: >
   Install the system packages, the Rust toolchain and the pinned LLVM, and build (or restore)
-  the libtcg lifters into .deps/out. .deps and target live on /mnt: the unpacked LLVM alone is
-  12 GB.
+  the libtcg lifters into .deps/out. On Linux, .deps and target live on /mnt: the unpacked LLVM
+  alone is 12 GB. macOS builds no helper bitcode: download it into .deps/out afterwards.
 
 runs:
   using: composite
   steps:
-    - name: System packages
+    - name: System packages (Linux)
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update -q
@@ -15,6 +16,17 @@ runs:
           build-essential curl zstd xz-utils ninja-build pkg-config \
           python3 python3-venv libglib2.0-dev elfutils \
           zlib1g-dev libzstd-dev libxml2-dev liblzma-dev libffi-dev libxkbcommon-dev
+
+    - name: System packages (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install --quiet ninja glib pkgconf zstd xz
+        # The pinned clang (QEMU, bindgen) needs the SDK spelled out; the linker
+        # needs Homebrew's zstd and liblzma.
+        echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+        echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
+        df -h / /System/Volumes/Data
 
     - name: Rust
       shell: bash
@@ -24,6 +36,7 @@ runs:
         rustc --version
 
     - name: Space on /mnt
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo mkdir -p /mnt/deps /mnt/target
@@ -35,7 +48,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: .deps/dl
-        key: deps-dl-${{ hashFiles('scripts/versions.sh') }}
+        key: deps-dl-${{ runner.os }}-${{ hashFiles('scripts/versions.sh') }}
 
     - name: Fetch QEMU and LLVM
       shell: bash
@@ -46,7 +59,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: .deps/out
-        key: libtcg-${{ runner.os }}-${{ hashFiles('scripts/**', 'patches/**', 'libtcg/**') }}
+        key: libtcg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/**', 'patches/**', 'libtcg/**') }}
 
     - name: Build lifters
       if: steps.lifters.outputs.cache-hit != 'true'

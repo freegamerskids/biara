@@ -119,7 +119,7 @@ struct LiftArgs {
     /// than keep those the ABI analysis finds preserved in SSA form.
     #[arg(long)]
     no_abi: bool,
-    /// libtcg shared object; default $BIARA_LIBTCG_DIR/libtcg-<arch>.so.
+    /// libtcg shared library; default $BIARA_LIBTCG_DIR/libtcg-<arch>.so (.dylib on macOS).
     #[arg(long)]
     libtcg: Option<PathBuf>,
     /// Helper bitcode; default $BIARA_LIBTCG_DIR/helpers-<arch>.bc.

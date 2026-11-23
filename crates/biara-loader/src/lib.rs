@@ -106,7 +106,7 @@ pub struct DebugStatus {
 
 #[derive(Debug)]
 pub struct Image {
-    /// QEMU target name of the guest architecture (`libtcg-<arch>.so`).
+    /// QEMU target name of the guest architecture (`libtcg-<arch>.so`, `.dylib` on macOS).
     pub arch: &'static str,
     /// The operating system the image is for, which fixes its calling
     /// conventions (`biara_cfg::spec`): `"linux"` (ELF), `"windows"` (PE),

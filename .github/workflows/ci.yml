@@ -20,13 +20,46 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  test:
-    name: Build and test
+  # The helper bitcode is built on Linux x86-64 only (scripts/build-libtcg.sh);
+  # macOS uses this one.
+  helpers:
+    name: Helper bitcode
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helpers
+          path: .deps/out/helpers-*.bc
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86-64
+    needs: helpers
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+
+  macos:
+    name: macOS arm64
+    needs: helpers
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v8
+        with:
+          name: helpers
+          path: .deps/out
       - name: Build
         run: cargo build --workspace --all-targets --locked
       - name: Test

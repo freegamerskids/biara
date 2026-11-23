@@ -1,0 +1,83 @@
+diff -r a/common-user/meson.build b/common-user/meson.build
+--- a/common-user/meson.build	2026-11-23 21:05:35.229692473 +0100
++++ b/common-user/meson.build	2026-11-23 21:05:35.243879716 +0100
+@@ -4,6 +4,10 @@
+ 
+ common_user_inc += include_directories('host/' / host_arch)
+ 
++if host_os != 'linux'
++  subdir_done()
++endif
++
+ user_ss.add(files(
+   'mmap-min-addr.c',
+   'probe-guest-base.c',
+diff -r a/configure b/configure
+--- a/configure	2026-11-23 21:05:35.229032854 +0100
++++ b/configure	2026-11-23 21:05:35.242204911 +0100
+@@ -793,7 +793,9 @@
+     if [ "$linux_user" != no ]; then
+         if [ "$host_os" = linux ]; then
+             linux_user=yes
+-        elif [ "$linux_user" = yes ]; then
++        elif [ "$linux_user" = yes ] && [ "$host_os" != darwin ]; then
++            # Elsewhere only libtcg is built from a linux-user target (see
++            # meson.build), never the emulator.
+             error_exit "linux-user not supported on this architecture"
+         fi
+         if [ "$linux_user" = "yes" ]; then
+diff -r a/linux-user/meson.build b/linux-user/meson.build
+--- a/linux-user/meson.build	2026-11-23 21:05:35.229510221 +0100
++++ b/linux-user/meson.build	2026-11-23 21:05:35.243859799 +0100
+@@ -59,4 +59,6 @@
+ subdir('x86_64')
+ subdir('xtensa')
+ 
+-specific_ss.add_all(when: 'CONFIG_LINUX_USER', if_true: linux_user_ss)
++if host_os == 'linux'
++  specific_ss.add_all(when: 'CONFIG_LINUX_USER', if_true: linux_user_ss)
++endif
+diff -r a/meson.build b/meson.build
+--- a/meson.build	2026-11-23 21:05:35.229267959 +0100
++++ b/meson.build	2026-11-23 21:05:35.243761496 +0100
+@@ -3286,7 +3286,7 @@
+ foreach target : target_dirs
+   config_target = { 'TARGET_NAME': target.split('-')[0] }
+   if target.endswith('linux-user')
+-    if host_os != 'linux'
++    if host_os not in ['linux', 'darwin']
+       if default_targets
+         continue
+       endif
+@@ -4312,7 +4312,7 @@
+       base_dir,
+       base_dir / abi,
+     )
+-    if 'CONFIG_LINUX_USER' in config_target
++    if 'CONFIG_LINUX_USER' in config_target and host_os == 'linux'
+       dir = base_dir / abi
+       arch_srcs += files(
+         dir / 'cpu_loop.c',
+@@ -4492,7 +4492,21 @@
+ 
+   # libtcg: the same objects as qemu-<target>, linked as a shared library
+   # exposing only the libtcg_* translation API (see libtcg/libtcg.h).
+-  if target_type == 'user' and 'CONFIG_LINUX_USER' in config_target
++  # On macOS the linux-user and common-user sources are not built (they
++  # need a Linux host); libtcg/user-stubs.c stands in for what the
++  # translator links against.
++  if target_type == 'user' and 'CONFIG_LINUX_USER' in config_target and host_os == 'darwin'
++    shared_library('tcg-' + target_name,
++                   files('libtcg/libtcg.c', 'libtcg/user-stubs.c'),
++                   c_args: c_args,
++                   include_directories: target_inc + include_directories('libtcg'),
++                   dependencies: arch_deps + [target_stubs],
++                   objects: lib.extract_all_objects(recursive: true),
++                   link_args: link_args + ['-Wl,-exported_symbol,_libtcg_*'],
++                   name_prefix: 'lib',
++                   build_by_default: true,
++                   install: false)
++  elif target_type == 'user' and 'CONFIG_LINUX_USER' in config_target
+     libtcg_ver = meson.current_source_dir() / 'libtcg' / 'libtcg.ver'
+     shared_module('tcg-' + target_name,
+                   files('libtcg/libtcg.c'),

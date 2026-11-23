@@ -150,12 +150,17 @@ static LOADED: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<Libtcg>>>>> =
     LazyLock::new(Default::default);
 
 impl Libtcg {
-    /// `$BIARA_LIBTCG_DIR/libtcg-<arch>.so`, if present.
+    /// `$BIARA_LIBTCG_DIR/libtcg-<arch>.so` (`.dylib` on macOS), if present.
     pub fn find(arch: &str) -> Result<PathBuf, Error> {
         std::env::var_os("BIARA_LIBTCG_DIR")
-            .map(|d| Path::new(&d).join(format!("libtcg-{arch}.so")))
+            .map(|d| Path::new(&d).join(Self::file_name(arch)))
             .filter(|p| p.is_file())
             .ok_or_else(|| Error::NotFound(arch.to_owned()))
+    }
+
+    /// The library's file name for `arch`: `libtcg-<arch>.so`, or `.dylib` on macOS.
+    pub fn file_name(arch: &str) -> String {
+        format!("libtcg-{arch}{}", std::env::consts::DLL_SUFFIX)
     }
 
     /// Load the library at `path` (once per process) and create its QEMU

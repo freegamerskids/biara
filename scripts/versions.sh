@@ -30,10 +30,10 @@ Darwin-arm64)
 esac
 LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${LLVM_ASSET}"
 
-# GNU `sha256sum` where there is one, else `shasum` (macOS's own sha256sum
-# lacks --status and --quiet).
+# GNU `sha256sum`; macOS's own sha256sum lacks --status and --quiet, so
+# `shasum` there.
 sha256_check() {
-    if sha256sum --version >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
+    if [[ $(uname -s) == Darwin ]]; then shasum -a 256 "$@"; else sha256sum "$@"; fi
 }
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

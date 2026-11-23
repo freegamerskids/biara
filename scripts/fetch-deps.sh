@@ -26,6 +26,13 @@ if [[ ! -x $LLVM_PREFIX/bin/llvm-config ]]; then
         | tar -x -C "$LLVM_PREFIX" --strip-components=1
 fi
 
+# The macOS release also ships its own libc++, libc++abi and libunwind. The
+# link searches LLVM's lib/ first (llvm-sys), and would take them instead of
+# the system's.
+if [[ $(uname -s) == Darwin ]]; then
+    rm -f "$LLVM_PREFIX"/lib/libc++* "$LLVM_PREFIX"/lib/libunwind*
+fi
+
 # llvm-sys runs $LLVM_SYS_231_PREFIX/bin/llvm-config. The release builds
 # report zstd as an absolute path on their build machine; rewrite it to
 # -lzstd.

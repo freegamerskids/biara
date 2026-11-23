@@ -26,7 +26,22 @@ runs:
         # needs Homebrew's zstd and liblzma.
         echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
         echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
-        df -h / /System/Volumes/Data
+
+    # LLVM (about 10 GB unpacked) plus a debug build whose every test binary links LLVM
+    # statically outgrow the runner's free space; drop what the build never uses.
+    - name: Free disk space (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        df -h /System/Volumes/Data
+        keep=$(realpath "$(xcode-select -p)/../..")
+        for app in /Applications/Xcode*.app; do
+          [[ -L $app || $(realpath "$app") == "$keep" ]] || sudo rm -rf "$app"
+        done
+        sudo rm -rf ~/Library/Android /usr/local/share/android-sdk \
+          ~/Library/Developer/CoreSimulator /Library/Developer/CoreSimulator/Volumes \
+          ~/.dotnet /usr/local/share/dotnet ~/hostedtoolcache /Users/runner/hostedtoolcache
+        df -h /System/Volumes/Data
 
     - name: Rust
       shell: bash

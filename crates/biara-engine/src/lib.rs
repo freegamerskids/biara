@@ -24,6 +24,8 @@
 //! coordinator and its worker pool: the coordinator keeps half and each worker
 //! is spawned under an inherited `RLIMIT_AS` of `remaining/workers`, so the sum
 //! of hard caps never exceeds the budget (parents only lower inherited caps).
+//! macOS does not enforce `RLIMIT_AS`; there each process watches its own
+//! footprint against it ([`enforce_address_space_limit`]).
 //! `Session::set_progress` installs an optional durable-checkpoint observer;
 //! `Session::pool_size` reports the actual spawned worker count for supervision.
 //!
@@ -44,6 +46,7 @@
 //! (or `$HOME/.cache`); an explicit database can hold multiple images. Discovery
 //! candidates and partial recovery are distinct from finished analysis requests.
 mod checkpoint;
+mod memory;
 mod store;
 mod worker;
 use biara_lift::{RecoverySnapshot, RecoveryState, ResolutionArtifact};
@@ -55,6 +58,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+pub use memory::enforce_address_space_limit;
 pub use worker::worker;
 use worker::{Config, GuestError, Pool, Request, Response, Translation};
 

@@ -88,21 +88,35 @@ Every result carries its evidence, so you can tell a proven fact from a guess.
 
 ## Install
 
-Linux x86-64 is the host. The toolchain is pinned and fetched for you:
+Hosts are Linux x86-64 and macOS arm64 (Apple silicon). Release archives for both are on the
+[releases page](https://github.com/freegamerskids/biara/releases); unpack one and run `biara` or
+`biara-ui` from it (the lifters sit next to them). On macOS, clear the download quarantine
+first: `xattr -dr com.apple.quarantine biara-*-arm64-macos`.
+
+To build, the toolchain is pinned and fetched for you:
 
 | Piece | Version | Where it comes from |
 | --- | --- | --- |
-| QEMU | 11.1.2 | downloaded by `scripts/fetch-deps.sh`, patched and built as `libtcg-<arch>.so` |
+| QEMU | 11.1.2 | downloaded by `scripts/fetch-deps.sh`, patched and built as `libtcg-<arch>.so` (`.dylib` on macOS) |
 | LLVM | 23.1.2 | prebuilt release, unpacked into `.deps/` (several GB) |
 | Rust | recent stable (edition 2024) | your `rustup` |
 
 You also need what QEMU's build needs: Python 3, `ninja`, glib development headers, plus `curl`
-and `zstd`.
+and `zstd`. On macOS: `brew install ninja glib pkgconf zstd xz`.
 
 ```sh
 scripts/fetch-deps.sh                 # download and verify QEMU and LLVM into .deps/
 scripts/build-libtcg.sh               # build the lifters (x86_64 and aarch64; pass names for one)
 cargo build --release                 # target/release/biara and target/release/biara-ui
+```
+
+The helper bitcode (`helpers-<arch>.bc`) is built on Linux only: it is compiled for the x86-64
+analysis target, and QEMU's helpers contain host-specific code. On macOS, copy the
+`helpers-*.bc` of a Linux build or a release archive into `.deps/out/`, and point the pinned
+clang at the SDK and the linker at Homebrew before building:
+
+```sh
+export SDKROOT=$(xcrun --show-sdk-path) LIBRARY_PATH=$(brew --prefix)/lib
 ```
 
 `.cargo/config.toml` points the build at `.deps/`, so `cargo run` and `cargo test` just work.
@@ -242,7 +256,7 @@ bytes do pass through QEMU's frontends, so treat hostile input accordingly.)
 
 | Crate | Role |
 | --- | --- |
-| `libtcg-sys`, `biara-tcg` | Runtime-loaded bindings to `libtcg-<arch>.so` and a safe TCG IR |
+| `libtcg-sys`, `biara-tcg` | Runtime-loaded bindings to `libtcg-<arch>.so`/`.dylib` and a safe TCG IR |
 | `biara-loader` | ELF, PE and Mach-O: segments, symbols, imports, function starts, DWARF |
 | `biara-cfg` | Control-flow recovery over translation blocks |
 | `biara-abi` | Stack frames and calling conventions |
@@ -281,7 +295,7 @@ biara is young.
 - Struct fields can be renamed only in a struct some function parameter points at: naming
   one declares it and types that parameter `struct name *` in the function's signature.
 - Recovery sometimes lifts a stray non-code byte (94 in all of glibc); the listing shows `db`.
-- The host is Linux x86-64; guests are x86-64 and AArch64.
+- Hosts are Linux x86-64 and macOS arm64; guests are x86-64 and AArch64.
 
 ## Tests
 
@@ -297,7 +311,7 @@ drive the app through Rune's headless runtime with typed keys and clicks.
 ## License
 
 biara is [MIT](LICENSE) licensed, with one exception that matters if you distribute builds:
-QEMU is GPL, so the patch in `patches/` is GPL-2.0-or-later, and the `libtcg-<arch>.so` and
-helper bitcode it produces are GPL binaries. The Rust code only loads them at run time. Details
+QEMU is GPL, so the patches in `patches/` are GPL-2.0-or-later, and the `libtcg-<arch>`
+libraries and helper bitcode built from them are GPL binaries. The Rust code only loads them at run time. Details
 in [`patches/README.md`](patches/README.md) and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

@@ -1,8 +1,8 @@
 name: Release
 
-# A `v*` tag builds the Linux x86-64 binaries with their lifters and publishes them, with the
-# GPL source of the lifters, as a GitHub release. A manual run builds the same archives as
-# workflow artifacts only.
+# A `v*` tag builds the Linux x86-64 and macOS arm64 binaries with their lifters and publishes
+# them, with the GPL source of the lifters, as a GitHub release. A manual run builds the same
+# archives as workflow artifacts only.
 on:
   push:
     tags: ['v*']
@@ -16,13 +16,47 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  release:
-    name: Build release archives
-    runs-on: ubuntu-24.04
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      matrix:
+        include:
+          - platform: x86_64-linux
+            runner: ubuntu-24.04
+          - platform: arm64-macos
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
+
+      # The helper bitcode is a Linux build (scripts/build-libtcg.sh): macOS waits for it.
+      - name: Share the helper bitcode
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: helpers
+          path: .deps/out/helpers-*.bc
+          if-no-files-found: error
+      - name: Wait for the helper bitcode
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 120); do
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+              --jq '.artifacts[].name' | grep -qx helpers && exit 0
+            sleep 30
+          done
+          echo "no helper bitcode from the Linux build" >&2
+          exit 1
+      - name: Fetch the helper bitcode
+        if: runner.os == 'macOS'
+        uses: actions/download-artifact@v8
+        with:
+          name: helpers
+          path: .deps/out
 
       - name: Build
         run: cargo build --release --locked -p biara-cli -p biara-ui
@@ -32,39 +66,51 @@ jobs:
           source scripts/versions.sh
           version=${GITHUB_REF_NAME#v}
           [[ $GITHUB_REF_TYPE == tag ]] || version=$(git rev-parse --short HEAD)
-          name=biara-$version-x86_64-linux
+          name=biara-$version-${{ matrix.platform }}
           mkdir -p dist/$name
           # biara-ui and `biara mcp` find the lifters next to the executable; `biara lift`
           # takes BIARA_LIBTCG_DIR.
-          cp target/release/biara target/release/biara-ui .deps/out/libtcg-*.so \
+          cp target/release/biara target/release/biara-ui .deps/out/libtcg-*.$DSO \
             .deps/out/helpers-*.bc dist/$name/
-          cp -r LICENSE THIRD_PARTY_NOTICES.md README.md licenses dist/$name/
+          cp -R LICENSE THIRD_PARTY_NOTICES.md README.md licenses dist/$name/
           cp patches/README.md dist/$name/LIFTERS-LICENSE.md
           tar -C dist -cJf dist/$name.tar.xz $name
 
-          # libtcg-*.so and helpers-*.bc are GPL binaries: ship their corresponding source.
-          src=biara-$version-lifters-source
-          mkdir -p dist/$src/scripts
-          cp .deps/dl/qemu-$QEMU_VERSION.tar.xz dist/$src/
-          cp -r patches libtcg dist/$src/
-          cp scripts/versions.sh scripts/fetch-deps.sh scripts/build-libtcg.sh \
-            scripts/helper-bitcode.py dist/$src/scripts/
-          tar -C dist -cJf dist/$src.tar.xz $src
-
-          (cd dist && sha256sum *.tar.xz > SHA256SUMS)
+          # libtcg-* and helpers-*.bc are GPL binaries: ship their corresponding source
+          # (one archive covers both platforms).
+          if [[ $RUNNER_OS == Linux ]]; then
+            src=biara-$version-lifters-source
+            mkdir -p dist/$src/scripts
+            cp .deps/dl/qemu-$QEMU_VERSION.tar.xz dist/$src/
+            cp -R patches libtcg dist/$src/
+            cp scripts/versions.sh scripts/fetch-deps.sh scripts/build-libtcg.sh \
+              scripts/helper-bitcode.py dist/$src/scripts/
+            tar -C dist -cJf dist/$src.tar.xz $src
+          fi
           ls -l dist
 
       - uses: actions/upload-artifact@v7
         with:
-          name: biara-x86_64-linux
-          path: |
-            dist/*.tar.xz
-            dist/SHA256SUMS
+          name: dist-${{ matrix.platform }}
+          path: dist/*.tar.xz
+          if-no-files-found: error
 
-      - name: Publish
-        if: github.ref_type == 'tag'
+  publish:
+    name: Publish
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.xz dist/SHA256SUMS \
-            --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          cd dist
+          sha256sum *.tar.xz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" *.tar.xz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

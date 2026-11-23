@@ -232,6 +232,7 @@ pub(crate) fn limit_address_space(bytes: u64) -> Result<()> {
         if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
+        biara_engine::enforce_address_space_limit();
     }
     #[cfg(not(unix))]
     bail!("memory budgets require Unix resource limits");

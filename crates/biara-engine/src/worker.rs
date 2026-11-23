@@ -84,6 +84,8 @@ fn read_frame<T: serde::de::DeserializeOwned>(input: &mut impl Read) -> Result<O
 
 pub fn worker(config: &str) -> Result<(), Error> {
     let config: Config = serde_json::from_str(config)?;
+    // The coordinator set RLIMIT_AS before exec; macOS needs it enforced.
+    crate::memory::enforce_address_space_limit();
     #[cfg(target_os = "linux")]
     {
         // Drop is not run when the coordinator is killed by a signal. Register

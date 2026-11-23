@@ -15,9 +15,13 @@ if (($#)); then targets=("$@"); else targets=(x86_64 aarch64); fi
 target_list=$(printf '%s-linux-user,' "${targets[@]}")
 target_list=${target_list%,}
 
-# The pinned clang does not look for the macOS SDK by itself.
+# The pinned clang does not look for the macOS SDK by itself. The SDK keeps
+# ffi.h in a subdirectory, and QEMU's per-target stub libraries include it
+# without the libffi dependency's flags.
+extra_cflags=()
 if [[ $(uname -s) == Darwin ]]; then
     export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
+    extra_cflags=(--extra-cflags="-I$SDKROOT/usr/include/ffi")
 fi
 
 [[ -x $LLVM_PREFIX/bin/clang ]] || { echo "run scripts/fetch-deps.sh first" >&2; exit 1; }
@@ -57,7 +61,8 @@ if [[ ! -f $QEMU_BUILD/build.ninja ]] \
         --enable-tcg-interpreter \
         --disable-plugins \
         --disable-docs \
-        --disable-werror)
+        --disable-werror \
+        "${extra_cflags[@]}")
     echo "$target_list" > "$QEMU_BUILD/.biara-targets"
 fi
 

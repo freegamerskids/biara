@@ -62,22 +62,5 @@ jobs:
           path: .deps/out
       - name: Build
         run: cargo build --workspace --all-targets --locked
-      - name: Diagnose the link (temporary)
-        if: failure()
-        run: |
-          cat > "$RUNNER_TEMP/cc-wrap" <<'EOF'
-          #!/bin/bash
-          cc "$@" > "$LINK_LOG" 2>&1; rc=$?; echo "exit status $rc" >> "$LINK_LOG"; exit $rc
-          EOF
-          chmod +x "$RUNNER_TEMP/cc-wrap"
-          try() {
-            echo "=== $1"
-            LINK_LOG="$RUNNER_TEMP/$1.log" cargo rustc -p biara-cli --bin biara --locked -- \
-              -C linker="$RUNNER_TEMP/cc-wrap" "${@:2}" > /dev/null 2>&1 || true
-            tail -c 3000 "$RUNNER_TEMP/$1.log"
-          }
-          try default -C link-arg=-Wl,-v
-          try classic -C link-arg=-Wl,-ld_classic
-          try lld -C link-arg=--ld-path=$PWD/.deps/llvm-23.1.2/bin/ld64.lld
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast

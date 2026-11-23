@@ -113,10 +113,10 @@ cargo build --release                 # target/release/biara and target/release/
 The helper bitcode (`helpers-<arch>.bc`) is built on Linux only: it is compiled for the x86-64
 analysis target, and QEMU's helpers contain host-specific code. On macOS, copy the
 `helpers-*.bc` of a Linux build or a release archive into `.deps/out/`, and point the pinned
-clang at the SDK and the linker at Homebrew before building:
+clang at the SDK before building:
 
 ```sh
-export SDKROOT=$(xcrun --show-sdk-path) LIBRARY_PATH=$(brew --prefix)/lib
+export SDKROOT=$(xcrun --show-sdk-path)
 ```
 
 `.cargo/config.toml` points the build at `.deps/`, so `cargo run` and `cargo test` just work.

@@ -61,6 +61,13 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p biara-cli -p biara-ui
 
+      - name: Check the macOS binaries need only the system
+        if: runner.os == 'macOS'
+        run: |
+          otool -L target/release/biara target/release/biara-ui
+          ! otool -L target/release/biara target/release/biara-ui | grep -v '^target/' \
+            | grep -v -e '/usr/lib/' -e '/System/Library/'
+
       - name: Package
         run: |
           source scripts/versions.sh

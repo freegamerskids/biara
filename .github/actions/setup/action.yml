@@ -22,10 +22,8 @@ runs:
       shell: bash
       run: |
         brew install --quiet ninja glib pkgconf zstd xz
-        # The pinned clang (QEMU, bindgen) needs the SDK spelled out; the linker
-        # needs Homebrew's zstd and liblzma.
+        # The pinned clang (QEMU, bindgen, the linker) needs the SDK spelled out.
         echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
-        echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
 
     # LLVM (about 10 GB unpacked) plus a debug build whose every test binary links LLVM
     # statically outgrow the runner's free space; drop what the build never uses.

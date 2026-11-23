@@ -26,11 +26,18 @@ if [[ ! -x $LLVM_PREFIX/bin/llvm-config ]]; then
         | tar -x -C "$LLVM_PREFIX" --strip-components=1
 fi
 
-# The macOS release also ships its own libc++, libc++abi and libunwind. The
-# link searches LLVM's lib/ first (llvm-sys), and would take them instead of
-# the system's.
+# The macOS release also ships its own libc++ (headers and libraries),
+# libc++abi and libunwind. The link searches LLVM's lib/ first (llvm-sys) and
+# would take them; its newer headers call into a libc++ macOS does not have.
+# Without them the pinned clang uses the SDK's, like the system's library.
 if [[ $(uname -s) == Darwin ]]; then
-    rm -f "$LLVM_PREFIX"/lib/libc++* "$LLVM_PREFIX"/lib/libunwind*
+    rm -rf "$LLVM_PREFIX"/include/c++ "$LLVM_PREFIX"/lib/libc++* "$LLVM_PREFIX"/lib/libunwind*
+    # LLVM wants zstd and biara-loader liblzma, which macOS lacks. Offer only
+    # Homebrew's static archives (.cargo/config.toml searches here first), so
+    # the binaries run without Homebrew.
+    mkdir -p "$DEPS/macos-static"
+    ln -sf "$(brew --prefix zstd)/lib/libzstd.a" "$(brew --prefix xz)/lib/liblzma.a" \
+        "$DEPS/macos-static/"
 fi
 
 # llvm-sys runs $LLVM_SYS_231_PREFIX/bin/llvm-config. The release builds

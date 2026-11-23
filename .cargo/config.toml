@@ -14,8 +14,13 @@ MACOSX_DEPLOYMENT_TARGET = "14.0"
 
 # The macOS LLVM release ships its static libraries as LLVM 23 bitcode, which Apple's linker
 # (LLVM 17 inside) cannot read: link with the release's own clang and lld. The ThinLTO cache
-# (relative to the workspace root, where rustc runs) spares the many test binaries from
-# compiling LLVM's bitcode again on every link.
+# spares the many test binaries from compiling LLVM's bitcode again on every link. zstd and
+# liblzma come from Homebrew's static archives (scripts/fetch-deps.sh). Paths are relative to
+# the workspace root, where rustc runs.
 [target.aarch64-apple-darwin]
 linker = ".deps/llvm-23.1.2/bin/clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-cache_path_lto,target/lto-cache"]
+rustflags = [
+    "-C", "link-arg=-fuse-ld=lld",
+    "-C", "link-arg=-Wl,-cache_path_lto,target/lto-cache",
+    "-L", "native=.deps/macos-static",
+]

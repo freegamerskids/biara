@@ -62,5 +62,11 @@ jobs:
           path: .deps/out
       - name: Build
         run: cargo build --workspace --all-targets --locked
+      - name: Diagnose the link (temporary)
+        if: failure()
+        run: |
+          vm_stat | head -5
+          cargo build -p biara-cli -j1 --locked 2>&1 | tail -30 || true
+          cargo rustc -p biara-cli --bin biara --locked -- -C link-arg=-Wl,-v 2>&1 | tail -40 || true
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast

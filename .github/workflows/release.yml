@@ -116,6 +116,21 @@ jobs:
           fi
           ls -l dist
 
+      # The unpacked archive decompiles on its own: lifters, helpers and (macOS) the
+      # bundled libraries load from it.
+      - name: Smoke-test the archive
+        run: |
+          tmp=$(mktemp -d)
+          tar -xJf dist/biara-*-${{ matrix.platform }}.tar.xz -C "$tmp"
+          app=$(echo "$tmp"/biara-*)
+          printf '%s\n' '__attribute__((noinline)) long triple(long x) { return x * 3 + 1; }' \
+            'void _start(void) { for (;;) triple(2); }' > "$tmp/guest.c"
+          .deps/llvm-23.1.2/bin/clang --target=x86_64-linux-gnu -O1 -ffreestanding -nostdlib \
+            -static -fuse-ld=lld "$tmp/guest.c" -o "$tmp/guest"
+          BIARA_LIBTCG_DIR=$app "$app/biara" lift "$tmp/guest" triple --emit decomp \
+            --database "$tmp/db.sqlite" | tee "$tmp/out.txt"
+          grep -q triple "$tmp/out.txt"
+
       - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.platform }}

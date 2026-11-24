@@ -219,21 +219,7 @@ pub(crate) fn limit_address_space(bytes: u64) -> Result<()> {
         bail!("coordinator address-space budget must be at least 1 GiB");
     }
     #[cfg(unix)]
-    {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        limit.rlim_cur = (bytes as libc::rlim_t).min(limit.rlim_max);
-        limit.rlim_max = limit.rlim_cur;
-        if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        biara_engine::enforce_address_space_limit();
-    }
+    biara_engine::limit_memory(bytes)?;
     #[cfg(not(unix))]
     bail!("memory budgets require Unix resource limits");
     Ok(())
@@ -425,25 +411,7 @@ fn run_worker(args: WorkerArgs, mut job: JobSpec, progress: &mut Progress) -> Re
         if cap < biara_proto::MIN_WORKER_BYTES {
             bail!("service memory budget must be at least 2 GiB");
         }
-        unsafe {
-            command.pre_exec(move || {
-                let limit = libc::rlimit {
-                    rlim_cur: cap as libc::rlim_t,
-                    rlim_max: cap as libc::rlim_t,
-                };
-                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                let core = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        biara_engine::limit_child_memory(&mut command, cap);
     }
     #[cfg(not(unix))]
     {

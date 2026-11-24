@@ -20,7 +20,9 @@ use std::{
 use common::corpus::{self, *};
 
 use biara_cfg::Cfg;
-use biara_lift::{RUN, ResolveOptions, analysis_machine, lift, optimize, recover_resolving};
+use biara_lift::{
+    RUN, ResolveOptions, analysis_machine, lift, native_machine, optimize, recover_resolving,
+};
 use biara_loader::Image;
 use biara_tcg::Libtcg;
 use inkwell::{OptimizationLevel, context::Context};
@@ -115,8 +117,13 @@ fn check(name: &str, reference: Ref) {
             if jit > 0 {
                 optimize(&module, &machine, jit).unwrap();
             }
+            // Run it natively: lifted for the analysis target (x86-64), the
+            // module is retargeted to the host before the JIT compiles it.
+            let native = native_machine().unwrap();
+            module.set_triple(&native.get_triple());
+            module.set_data_layout(&native.get_target_data().get_data_layout());
             let ee = module
-                .create_jit_execution_engine /* native JIT: module under test was lifted with analysis_machine */(OptimizationLevel::None)
+                .create_jit_execution_engine(OptimizationLevel::None)
                 .unwrap();
             for h in cfg.helpers() {
                 if let Some(decl) = module.get_function(&h.symbol()) {

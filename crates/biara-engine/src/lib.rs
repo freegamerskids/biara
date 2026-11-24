@@ -24,8 +24,8 @@
 //! coordinator and its worker pool: the coordinator keeps half and each worker
 //! is spawned under an inherited `RLIMIT_AS` of `remaining/workers`, so the sum
 //! of hard caps never exceeds the budget (parents only lower inherited caps).
-//! macOS does not enforce `RLIMIT_AS`; there each process watches its own
-//! footprint against it ([`enforce_address_space_limit`]).
+//! macOS refuses `RLIMIT_AS`; there each process watches its own footprint
+//! against the cap instead ([`limit_memory`]).
 //! `Session::set_progress` installs an optional durable-checkpoint observer;
 //! `Session::pool_size` reports the actual spawned worker count for supervision.
 //!
@@ -58,7 +58,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-pub use memory::enforce_address_space_limit;
+pub use memory::{inherit_memory_limit, limit_child_memory, limit_memory};
 pub use worker::worker;
 use worker::{Config, GuestError, Pool, Request, Response, Translation};
 

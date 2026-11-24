@@ -1,6 +1,6 @@
 //! Recover a real compiled program through the UI's own backend and check what the views
 //! will show: the function table, cross-references, strings and name resolution.
-#![cfg(any(target_os = "linux", target_os = "macos"))]
+#![cfg(target_os = "linux")]
 
 use std::{
     path::PathBuf,

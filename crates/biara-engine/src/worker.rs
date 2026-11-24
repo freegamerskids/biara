@@ -84,8 +84,8 @@ fn read_frame<T: serde::de::DeserializeOwned>(input: &mut impl Read) -> Result<O
 
 pub fn worker(config: &str) -> Result<(), Error> {
     let config: Config = serde_json::from_str(config)?;
-    // The coordinator set RLIMIT_AS before exec; macOS needs it enforced.
-    crate::memory::enforce_address_space_limit();
+    // The coordinator capped this worker before exec; macOS enforces it here.
+    crate::memory::inherit_memory_limit();
     #[cfg(target_os = "linux")]
     {
         // Drop is not run when the coordinator is killed by a signal. Register
@@ -246,34 +246,11 @@ impl Pool {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            let worker_budget = self.worker_budget;
-            // Inherit the coordinator's process group: the service supervisor
-            // isolates the coordinator once, and group RSS/kill then covers
-            // the whole job. A per-worker process_group(0) would escape
-            // supervision and orphan workers on coordinator SIGKILL.
-            unsafe {
-                child.pre_exec(move || {
-                    let limit = libc::rlimit {
-                        rlim_cur: worker_budget as libc::rlim_t,
-                        rlim_max: worker_budget as libc::rlim_t,
-                    };
-                    if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    let core = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
+        // Inherit the coordinator's process group: the service supervisor
+        // isolates the coordinator once, and group RSS/kill then covers the
+        // whole job. A per-worker process_group(0) would escape supervision
+        // and orphan workers on coordinator SIGKILL.
+        crate::memory::limit_child_memory(&mut child, self.worker_budget);
         let mut child = child.spawn()?;
         let input = child
             .stdin

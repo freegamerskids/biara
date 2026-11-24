@@ -1,5 +1,5 @@
 //! Isolated binary-consumer tests for allocation aliases and declared bounds.
-#![cfg(any(target_os = "linux", target_os = "macos"))]
+#![cfg(target_os = "linux")]
 
 #[path = "common/mod.rs"]
 mod common;

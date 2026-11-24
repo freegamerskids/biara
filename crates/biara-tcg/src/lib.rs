@@ -52,6 +52,8 @@ pub enum Error {
     Args { pc: u64 },
     #[error("translating {pc:#x}: libtcg_translate returned {code}")]
     Translate { pc: u64, code: i32 },
+    #[error("translating {pc:#x}: the lifter crashed")]
+    Crashed { pc: u64 },
     #[error("libtcg: unknown TCGType {0}")]
     UnknownType(u8),
     #[error("libtcg: unknown TCGTempKind {0}")]

@@ -3,14 +3,17 @@
 //! The coordinator owns canonical CFG updates and commits versioned SQLite WAL
 //! artifacts. Long-lived workers map immutable image snapshots and keep private
 //! QEMU state and LLVM contexts. Translation failures remain guest-analysis
-//! facts; IPC, storage and worker failures abort rather than masquerade as them.
+//! facts, and so does a block whose translation alone kills its worker (QEMU
+//! asserts on some invalid encodings); IPC and storage failures abort rather
+//! than masquerade as them.
 //!
 //! Cache identity binds binary bytes, libtcg bytes, CPU model, executable
 //! implementation and the pinned analysis triple (`biara_proto::ANALYSIS_TRIPLE`).
 //! Recovery variants additionally bind entry sets and limits,
 //! never the worker count. Resolution keys contain the relevant function body
 //! and callee facts, invalidating jobs when recovery changes their dependencies.
-//! Block jobs commit as responses arrive; graph checkpoints are throttled and
+//! Block jobs commit as responses arrive; graph checkpoints are throttled (to a
+//! multiple of their own cost, as each writes the whole manifest) and
 //! resolver checkpoints retain dependency rounds. Interrupted frontiers are
 //! rebuilt from committed graph/translation artifacts, not serialized threads.
 //! Translation workers take small leases and accept another as soon as they
@@ -51,14 +54,14 @@ mod store;
 mod worker;
 use biara_lift::{RecoverySnapshot, RecoveryState, ResolutionArtifact};
 use biara_tcg::{Block, ContextInfo, IrCodec, Libtcg, TranslationRequest, Translator};
+pub use memory::{inherit_memory_limit, limit_child_memory, limit_memory};
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
-pub use memory::{inherit_memory_limit, limit_child_memory, limit_memory};
 pub use worker::worker;
 use worker::{Config, GuestError, Pool, Request, Response, Translation};
 
@@ -108,10 +111,15 @@ pub struct Session {
     versions: checkpoint::Versions,
     progress: Option<ProgressObserver>,
     last_checkpoint: Instant,
+    /// Least time between progress checkpoints: a multiple of the last one's
+    /// cost, as each writes the whole graph manifest.
+    checkpoint_interval: Duration,
     translated: usize,
     reused: usize,
     resolved: usize,
     reused_resolutions: usize,
+    /// Translations whose worker exited: not sent to a worker again this session.
+    crashed_translations: BTreeSet<String>,
     /// Functions whose resolution worker exited this session: not tried
     /// again, as a later round's graph for them is only larger.
     failed_resolutions: BTreeSet<u64>,
@@ -186,10 +194,12 @@ impl Session {
             last_checkpoint: Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
+            checkpoint_interval: MIN_CHECKPOINT_INTERVAL,
             translated: 0,
             reused: 0,
             resolved: 0,
             reused_resolutions: 0,
+            crashed_translations: BTreeSet::new(),
             failed_resolutions: BTreeSet::new(),
             large_resolutions: BTreeSet::new(),
         })
@@ -269,7 +279,9 @@ impl Session {
                 if !seen.insert(key.clone()) || self.cached.contains_key(&key) {
                     continue;
                 }
-                if let Some(bytes) = self.store.get(&key)? {
+                if self.crashed_translations.contains(&key) {
+                    self.remember_crash(key, request.pc)?;
+                } else if let Some(bytes) = self.store.get(&key)? {
                     self.reused += 1;
                     self.remember(key, bytes);
                 } else {
@@ -291,62 +303,87 @@ impl Session {
             // Small leases keep an expensive block from trapping a worker's
             // remaining queue; completed workers immediately take another lease.
             let grain = misses.len().div_ceil(count).clamp(1, 4);
-            let mut groups = misses.chunks(grain);
+            let mut leases: VecDeque<Vec<usize>> = (0..misses.len())
+                .collect::<Vec<_>>()
+                .chunks(grain)
+                .map(<[usize]>::to_vec)
+                .collect();
             let mut in_flight = vec![None; count];
             let mut active = 0;
             for (index, assigned) in in_flight.iter_mut().enumerate() {
-                let Some(group) = groups.next() else { break };
-                self.pool()?.send(
-                    index,
-                    &Request::Translate(group.iter().map(|(_, request)| request.clone()).collect()),
-                )?;
-                *assigned = Some(group);
+                let Some(lease) = leases.pop_front() else {
+                    break;
+                };
+                self.pool()?
+                    .send(index, &translate_request(&misses, &lease))?;
+                *assigned = Some(lease);
                 active += 1;
             }
             while active != 0 {
-                // Same abort-not-fact contract as resolution: worker/IPC/DB
-                // errors propagate with durable checkpoints intact.
+                // Same abort-not-fact contract as resolution: IPC/DB errors
+                // propagate with durable checkpoints intact.
                 let (index, response) = self.pool()?.receive()?;
-                let Some(Response::Translate(results)) = response else {
-                    if response.is_none() {
-                        return Err(Error::Engine("analysis worker exited".into()));
-                    }
-                    return Err(Error::Engine("unexpected translation response".into()));
-                };
-                let group = in_flight
+                let lease = in_flight
                     .get_mut(index)
                     .and_then(Option::take)
                     .ok_or_else(|| Error::Engine("unexpected worker response index".into()))?;
-                if results.len() != group.len() {
-                    return Err(Error::Engine("translation response count differs".into()));
+                match response {
+                    Some(Response::Translate(results)) => {
+                        if results.len() != lease.len() {
+                            return Err(Error::Engine("translation response count differs".into()));
+                        }
+                        let encoded = lease
+                            .iter()
+                            .zip(results)
+                            .map(|(&request, result)| {
+                                Ok((misses[request].0.as_str(), postcard::to_stdvec(&result)?))
+                            })
+                            .collect::<Result<Vec<_>, Error>>()?;
+                        // Durability follows completion, independently of lease order.
+                        self.store.put(
+                            "translate",
+                            encoded.iter().map(|(key, bytes)| (*key, bytes.as_slice())),
+                        )?;
+                        for (key, bytes) in encoded {
+                            self.translated += 1;
+                            self.remember(key.to_owned(), bytes);
+                        }
+                    }
+                    // The lifter crashed on one of the lease's blocks (QEMU
+                    // asserts on some invalid encodings): retry them one by
+                    // one, so only the block that crashes it is lost.
+                    None if lease.len() > 1 => {
+                        self.pool()?.respawn(index)?;
+                        leases.extend(lease.iter().map(|&request| vec![request]));
+                    }
+                    // That block is untranslatable for this session. Nothing
+                    // is stored for it, so a later run (or lifter) tries again.
+                    None => {
+                        self.pool()?.respawn(index)?;
+                        let (key, request) = &misses[lease[0]];
+                        eprintln!(
+                            "analysis: the lifter crashed translating {:#x}; it stays untranslated",
+                            request.pc
+                        );
+                        self.crashed_translations.insert(key.clone());
+                        self.remember_crash(key.clone(), request.pc)?;
+                    }
+                    Some(_) => return Err(Error::Engine("unexpected translation response".into())),
                 }
-                let encoded = group
-                    .iter()
-                    .zip(results)
-                    .map(|((key, _), result)| Ok((key.as_str(), postcard::to_stdvec(&result)?)))
-                    .collect::<Result<Vec<_>, Error>>()?;
-                // Durability follows completion, independently of lease order.
-                self.store.put(
-                    "translate",
-                    encoded.iter().map(|(key, bytes)| (*key, bytes.as_slice())),
-                )?;
-                for (key, bytes) in encoded {
-                    self.translated += 1;
-                    self.remember(key.to_owned(), bytes);
-                }
-                if let Some(group) = groups.next() {
-                    self.pool()?.send(
-                        index,
-                        &Request::Translate(
-                            group.iter().map(|(_, request)| request.clone()).collect(),
-                        ),
-                    )?;
-                    in_flight[index] = Some(group);
+                if let Some(lease) = leases.pop_front() {
+                    self.pool()?
+                        .send(index, &translate_request(&misses, &lease))?;
+                    in_flight[index] = Some(lease);
                 } else {
                     active -= 1;
                 }
             }
         }
+        Ok(())
+    }
+    fn remember_crash(&mut self, key: String, pc: u64) -> Result<(), Error> {
+        let result: Result<Vec<u8>, GuestError> = Err(GuestError::Crashed(pc));
+        self.remember(key, postcard::to_stdvec(&result)?);
         Ok(())
     }
     fn remember(&mut self, key: String, bytes: Vec<u8>) {
@@ -625,6 +662,14 @@ pub fn export_database(
     db.execute_batch(&format!("VACUUM INTO '{escaped}';"))?;
     Ok(())
 }
+fn translate_request(misses: &[(String, Translation)], lease: &[usize]) -> Request {
+    Request::Translate(
+        lease
+            .iter()
+            .map(|&request| misses[request].1.clone())
+            .collect(),
+    )
+}
 fn merge(destination: &mut ResolutionArtifact, source: ResolutionArtifact) {
     for (pc, result) in source.targets {
         match destination.targets.entry(pc) {
@@ -678,14 +723,22 @@ impl Translator for Session {
         }
     }
 }
+/// Progress checkpoints write the whole graph manifest (hundreds of MiB for
+/// millions of blocks): spacing them by this multiple of their cost keeps
+/// them under a fifth of the recovery time.
+const CHECKPOINT_COST_FACTOR: u32 = 4;
+const MIN_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 impl biara_cfg::RecoveryBackend for Session {
     fn checkpoint_cfg(&mut self, cfg: &biara_cfg::Cfg) -> Result<(), biara_cfg::Error> {
-        if self.last_checkpoint.elapsed() < Duration::from_secs(2) {
+        if self.last_checkpoint.elapsed() < self.checkpoint_interval {
             return Ok(());
         }
         let result = (|| -> Result<(), Error> {
+            let start = Instant::now();
             self.save_checkpoint(cfg, None, false)?;
             self.last_checkpoint = Instant::now();
+            self.checkpoint_interval =
+                (start.elapsed() * CHECKPOINT_COST_FACTOR).max(MIN_CHECKPOINT_INTERVAL);
             eprintln!(
                 "analysis: recovering {} candidates; {} committed blocks",
                 cfg.functions.len(),

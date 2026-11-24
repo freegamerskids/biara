@@ -403,8 +403,8 @@ struct Recovery<'a, 'c, F> {
     regs: arch::Regs,
     opts: &'a Options,
     cfg: Cfg,
-    /// Bumped whenever a block is added or re-cut.
-    generation: u64,
+    /// What changed since the last pass, for picking the functions to explore again.
+    touched: Touched,
     /// Per `Discovery::extents` entry, the largest end of it and those
     /// before it.
     extents_end: Vec<u64>,
@@ -412,6 +412,18 @@ struct Recovery<'a, 'c, F> {
     rejected: BTreeSet<u64>,
     fatal: Option<biara_tcg::Error>,
     _code: std::marker::PhantomData<&'c [u8]>,
+}
+
+/// Graph changes that can alter explorations already done.
+#[derive(Default)]
+struct Touched {
+    /// Blocks re-cut shorter: their owners follow new exits.
+    cut: BTreeSet<u64>,
+    /// New function entries: a local jump to one becomes a tail call.
+    entries: BTreeSet<u64>,
+    /// Addresses that started or stopped failing to translate: whether a
+    /// call to one returns changed.
+    unresolved: BTreeSet<u64>,
 }
 
 struct Exploration {
@@ -477,7 +489,7 @@ pub fn recover_from<'c>(
             imports: opts.imports.clone(),
             ..previous
         },
-        generation: 0,
+        touched: Touched::default(),
         extents_end: opts
             .discovery
             .iter()
@@ -524,14 +536,12 @@ pub fn recover_from<'c>(
 
 impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
     fn fixpoint(&mut self) -> Result<(), Error> {
+        // Later passes explore only what the previous one can have changed:
+        // exploring everything again would make each pass as costly as the
+        // whole graph, and large binaries take thousands of passes.
+        let mut dirty: BTreeSet<_> = self.cfg.functions.keys().copied().collect();
         loop {
-            let mut dirty: BTreeSet<_> = self.cfg.functions.keys().copied().collect();
             while !dirty.is_empty() {
-                let before = (
-                    self.generation,
-                    self.cfg.functions.len(),
-                    self.cfg.unresolved.len(),
-                );
                 let mut states: BTreeMap<_, _> = dirty
                     .iter()
                     .copied()
@@ -605,13 +615,7 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
                             self.prefetch(&calls)?;
                             for target in calls {
                                 if self.ensure(target) {
-                                    self.cfg
-                                        .functions
-                                        .entry(target)
-                                        .or_insert_with(|| Function {
-                                            entry: target,
-                                            ..Default::default()
-                                        });
+                                    self.add_function(target);
                                 }
                             }
                             if self.cfg.functions.get(&entry) != Some(&state.function) {
@@ -628,32 +632,12 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
                     }
                     self.lib.checkpoint_cfg(&self.cfg)?;
                 }
-                dirty = if before
-                    != (
-                        self.generation,
-                        self.cfg.functions.len(),
-                        self.cfg.unresolved.len(),
-                    ) {
-                    // Splits, new entry boundaries and unknown callees can
-                    // change ownership or returnability outside direct callers.
-                    self.cfg.functions.keys().copied().collect()
-                } else {
-                    self.cfg
-                        .functions
-                        .iter()
-                        .filter_map(|(&entry, function)| {
-                            (changed.contains(&entry)
-                                || !function.calls.is_disjoint(&changed)
-                                || !function.tail_calls.is_disjoint(&changed))
-                            .then_some(entry)
-                        })
-                        .collect()
-                };
+                dirty = self.affected(&changed);
             }
-            let added = self.discover()?;
-            if !added {
+            if !self.discover()? {
                 break;
             }
+            dirty = self.affected(&BTreeSet::new());
         }
         // Functions whose entry never translated carry no information, and
         // blocks no function reaches any more (cut-off junk) are dropped.
@@ -701,13 +685,7 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
                     && !self.cfg.functions.contains_key(&t)
                     && self.is_import_stub(t)
                 {
-                    self.cfg.functions.insert(
-                        t,
-                        Function {
-                            entry: t,
-                            ..Default::default()
-                        },
-                    );
+                    self.add_function(t);
                 }
                 let fns = &self.cfg.functions;
                 match kind {
@@ -751,6 +729,49 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
         }
         f.returns = *has_return || f.tail_calls.iter().any(|&t| self.callee_returns(t));
         work.is_empty()
+    }
+
+    /// Functions whose exploration can differ from their last one: those that
+    /// changed or are new, those owning a re-cut block or a new entry (splits
+    /// and entry boundaries change ownership), and callers of a changed
+    /// function or of an address whose translatability flipped (returnability).
+    /// Explorations read nothing else that a pass changes.
+    fn affected(&mut self, changed: &BTreeSet<u64>) -> BTreeSet<u64> {
+        let Touched {
+            cut,
+            entries,
+            unresolved,
+        } = std::mem::take(&mut self.touched);
+        let owned: BTreeSet<u64> = cut.union(&entries).copied().collect();
+        let callees: BTreeSet<u64> = changed.union(&unresolved).copied().collect();
+        self.cfg
+            .functions
+            .iter()
+            .filter_map(|(&entry, function)| {
+                (changed.contains(&entry)
+                    || entries.contains(&entry)
+                    || !function.blocks.is_disjoint(&owned)
+                    || !function.calls.is_disjoint(&callees)
+                    || !function.tail_calls.is_disjoint(&callees))
+                .then_some(entry)
+            })
+            .collect()
+    }
+
+    fn add_function(&mut self, entry: u64) {
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.cfg.functions.entry(entry) {
+            slot.insert(Function {
+                entry,
+                ..Default::default()
+            });
+            self.touched.entries.insert(entry);
+        }
+    }
+
+    fn unresolve(&mut self, pc: u64, reason: String) {
+        if self.cfg.unresolved.insert(pc, reason).is_none() {
+            self.touched.unresolved.insert(pc);
+        }
     }
 
     /// Add the code-pointer candidates that pass `Discovery`'s checks as
@@ -802,17 +823,13 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
                     return Err(Error::Backend(error.to_string()));
                 }
                 if translated {
-                    self.cfg.functions.insert(
-                        c,
-                        Function {
-                            entry: c,
-                            ..Default::default()
-                        },
-                    );
+                    self.add_function(c);
                     self.cfg.discovered.insert(c);
                     added = true;
                 } else {
-                    self.cfg.unresolved.remove(&c);
+                    if self.cfg.unresolved.remove(&c).is_some() {
+                        self.touched.unresolved.insert(c);
+                    }
                     self.rejected.insert(c);
                 }
             }
@@ -930,15 +947,11 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
     fn translate(&mut self, pc: u64, max_insns: u32) -> bool {
         if self.cfg.blocks.len() >= self.opts.max_blocks && !self.cfg.blocks.contains_key(&pc) {
             self.cfg.recovery.block_limit_reached = true;
-            self.cfg
-                .unresolved
-                .insert(pc, format!("block limit {} reached", self.opts.max_blocks));
+            self.unresolve(pc, format!("block limit {} reached", self.opts.max_blocks));
             return false;
         }
         let Some((code, base)) = (self.code_at)(pc) else {
-            self.cfg
-                .unresolved
-                .insert(pc, "not in executable memory".into());
+            self.unresolve(pc, "not in executable memory".into());
             return false;
         };
         let mut block = match self.lib.translate(code, base, pc, max_insns) {
@@ -948,7 +961,7 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
                     self.fatal = Some(e);
                     return false;
                 }
-                self.cfg.unresolved.insert(pc, e.to_string());
+                self.unresolve(pc, e.to_string());
                 return false;
             }
         };
@@ -972,7 +985,7 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
                         self.fatal = Some(e);
                         return false;
                     }
-                    self.cfg.unresolved.insert(pc, e.to_string());
+                    self.unresolve(pc, e.to_string());
                     return false;
                 }
             }
@@ -985,23 +998,22 @@ impl<'c, F: Fn(u64) -> Option<(&'c [u8], u64)>> Recovery<'_, 'c, F> {
             .range(pc + 1..block.end())
             .find(|&&s| s.is_multiple_of(self.spec.insn_align) && !insns.contains(&s))
         {
-            self.cfg.unresolved.insert(
+            self.unresolve(
                 pc,
                 format!("instructions overlap function start {start:#x}"),
             );
             return false;
         }
         let (exits, constants) = exits::classify(&block, &self.regs, self.spec);
-        self.cfg.blocks.insert(
-            pc,
-            Arc::new(BasicBlock {
-                block,
-                insns,
-                exits,
-                constants,
-            }),
-        );
-        self.generation += 1;
+        let block = Arc::new(BasicBlock {
+            block,
+            insns,
+            exits,
+            constants,
+        });
+        if self.cfg.blocks.insert(pc, block).is_some() {
+            self.touched.cut.insert(pc);
+        }
         true
     }
 }
@@ -1345,6 +1357,41 @@ mod tests {
             assert!(cfg.functions[&BASE].returns);
             assert!(cfg.functions[&BASE].blocks.contains(&(BASE + 2)));
             assert!(cfg.issues().next().is_none());
+        });
+    }
+
+    #[test]
+    fn a_jump_target_that_later_becomes_a_function_is_a_tail_call() {
+        with_lib(|lib| {
+            let mut bytes = vec![0xc3; 0x26];
+            bytes[..2].copy_from_slice(&[0xeb, 0x0e]); // A: jmp L (BASE + 0x10: ret)
+            // B: call L; ret. B makes L a function only after A has taken L
+            // into its own body, and L's return then makes B continue.
+            bytes[0x20..0x25].copy_from_slice(&[0xe8, 0xeb, 0xff, 0xff, 0xff]);
+            let (l, b) = (BASE + 0x10, BASE + 0x20);
+            let cfg = recover(
+                lib,
+                |pc| code_at(&bytes, pc),
+                [BASE, b],
+                &Options::default(),
+            )
+            .unwrap();
+            assert_eq!(cfg.functions[&BASE].blocks, BTreeSet::from([BASE]));
+            assert_eq!(cfg.functions[&BASE].tail_calls, BTreeSet::from([l]));
+            assert!(cfg.functions[&BASE].returns);
+            assert_eq!(cfg.functions[&b].blocks, BTreeSet::from([b, b + 5]));
+            assert!(cfg.functions[&b].returns);
+        });
+    }
+
+    #[test]
+    fn vex256_encodings_of_128_bit_only_inserts_are_invalid_not_a_crash() {
+        with_lib(|lib| {
+            // vpinsrd xmm0, xmm0, eax, 0 with VEX.L=1 (#UD on hardware); ret.
+            let bytes = [0xc4, 0xe3, 0x7d, 0x22, 0xc0, 0x00, 0xc3];
+            let cfg = recover(lib, |pc| code_at(&bytes, pc), [BASE], &Options::default()).unwrap();
+            assert_eq!(cfg.blocks[&BASE].insns, vec![BASE]);
+            assert!(!cfg.blocks.contains_key(&(BASE + 6)));
         });
     }
 }

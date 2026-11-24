@@ -40,6 +40,8 @@ pub(crate) enum GuestError {
     Fetch(u64),
     Args(u64),
     Translate(u64, i32),
+    /// The worker exited while translating; recorded by the coordinator.
+    Crashed(u64),
 }
 impl GuestError {
     pub fn into_error(self) -> biara_tcg::Error {
@@ -47,6 +49,7 @@ impl GuestError {
             Self::Fetch(pc) => biara_tcg::Error::Fetch { pc },
             Self::Args(pc) => biara_tcg::Error::Args { pc },
             Self::Translate(pc, code) => biara_tcg::Error::Translate { pc, code },
+            Self::Crashed(pc) => biara_tcg::Error::Crashed { pc },
         }
     }
 }

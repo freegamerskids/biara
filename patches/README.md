@@ -6,7 +6,10 @@ The rest of this repository is MIT (see `../LICENSE`). Everything in this direct
 `include/exec/translator.h`, `meson.build`); `qemu-11.1.2/0002-libtcg-macos.patch` modifies
 `configure`, `meson.build`, `linux-user/meson.build`, `linux-user/syscall_defs.h`,
 `common-user/meson.build` and `gdbstub/user-target.c` so the linux-user targets' translator
-builds on macOS. QEMU is licensed under the GNU GPL, version 2 or
+builds on macOS; `qemu-11.1.2/0003-vex128-only.patch` makes `target/i386/tcg/decode-new.c.inc`
+reject VEX.L=1 encodings of the 128-bit-only (V)PINSR*/(V)PEXTR*/VINSERTPS/VEXTRACTPS as
+invalid opcodes, as the hardware does, instead of failing an assertion in the translator.
+QEMU is licensed under the GNU GPL, version 2 or
 (for these files) any later version, and a modification of those files is a derivative work
 under the same terms. The patches are therefore **GPL-2.0-or-later**, not MIT. QEMU's own license
 text is in `qemu-11.1.2/COPYING`.

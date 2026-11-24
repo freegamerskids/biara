@@ -90,8 +90,11 @@ Every result carries its evidence, so you can tell a proven fact from a guess.
 
 Hosts are Linux x86-64 and macOS arm64 (Apple silicon). Release archives for both are on the
 [releases page](https://github.com/freegamerskids/biara/releases); unpack one and run `biara` or
-`biara-ui` from it (the lifters sit next to them). On macOS, clear the download quarantine
-first: `xattr -dr com.apple.quarantine biara-*-arm64-macos`.
+`biara-ui` from it (the lifters sit next to them). Every commit on `main` and every pull request
+also gets both archives as artifacts of its
+[Release workflow run](https://github.com/freegamerskids/biara/actions/workflows/release.yml).
+On macOS, clear the download quarantine first:
+`xattr -dr com.apple.quarantine biara-*-arm64-macos`.
 
 To build, the toolchain is pinned and fetched for you:
 

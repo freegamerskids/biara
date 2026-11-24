@@ -1,15 +1,23 @@
 name: Release
 
-# A `v*` tag builds the Linux x86-64 and macOS arm64 binaries with their lifters and publishes
-# them, with the GPL source of the lifters, as a GitHub release. A manual run builds the same
-# archives as workflow artifacts only.
+# Builds the Linux x86-64 and macOS arm64 archives (binaries with their lifters) as workflow
+# artifacts for every push to main, pull request and manual run. A `v*` tag also publishes
+# them, with the GPL source of the lifters, as a GitHub release.
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
+# A newer commit on the same branch supersedes an unfinished build; tags always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 permissions:
-  contents: write
+  contents: read
+  actions: read # the macOS build polls this run's artifacts for the helper bitcode
 
 env:
   CARGO_TERM_COLOR: always
@@ -142,6 +150,8 @@ jobs:
     needs: build
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:

@@ -1,5 +1,8 @@
 //! Persistent analysis must not confuse code revisions, entry sets or budgets.
-#![cfg(target_os = "linux")]
+//!
+//! The guests are freestanding x86-64 Linux programs built with the pinned
+//! clang, so every host analyses them; only a Linux x86-64 host also runs them.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 use biara_loader::Image;
 use serde_json::Value;
 use std::{
@@ -7,6 +10,50 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
 };
+
+/// The host runs the x86-64 Linux guests too.
+const NATIVE: bool = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+
+/// Build freestanding x86-64 Linux `source` into `binary`.
+fn compile(source: &Path, binary: &Path, flags: &[&str]) {
+    let built = Command::new(env!("BIARA_CLANG"))
+        .args([
+            "--target=x86_64-linux-gnu",
+            "-ffreestanding",
+            "-nostdlib",
+            "-static",
+            "-fno-pie",
+            "-fno-builtin",
+            "-fuse-ld=lld",
+        ])
+        .args(flags)
+        .arg(source)
+        .arg("-o")
+        .arg(binary)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+}
+
+/// Run `binary` where the host can: it exits 0 when it computes what it should.
+fn check_runs(binary: &Path) {
+    if NATIVE {
+        assert!(Command::new(binary).status().unwrap().success());
+    }
+}
+
+/// `_start` exits with `main`'s result.
+const START: &str = r#"
+__attribute__((noreturn,used)) void _start(void) {
+    long status = main();
+    __asm__ volatile("syscall"::"a"(60L),"D"(status):"rcx","r11","memory");
+    __builtin_unreachable();
+}
+"#;
 
 fn build(dir: &Path, multiplier: u64, bias: u64) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
@@ -22,31 +69,13 @@ __attribute__((noinline,used)) uint64_t leaf(uint64_t x) {{
 }}
 __attribute__((noinline,used)) uint64_t other(uint64_t x) {{ return leaf(x)+10; }}
 int main(void) {{ return other(2)!={expected}; }}
-"#,
+{START}"#,
             expected = 2 * multiplier + bias + 10
         ),
     )
     .unwrap();
-    let built = Command::new(env!("BIARA_CLANG"))
-        .args([
-            "-O2",
-            "-g",
-            "-fno-builtin",
-            "-fno-pie",
-            "-no-pie",
-            "-fuse-ld=bfd",
-        ])
-        .arg(&source)
-        .arg("-o")
-        .arg(&binary)
-        .output()
-        .unwrap();
-    assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-    );
-    assert!(Command::new(&binary).status().unwrap().success());
+    compile(&source, &binary, &["-O2", "-g"]);
+    check_runs(&binary);
     binary
 }
 fn run(binary: &Path, database: &Path, root: &str, emit: &str, budget: &str, jobs: &str) -> Output {
@@ -97,6 +126,7 @@ int main(void) {{
         ),
     )
     .unwrap();
+    // The recovered C is plain C: it builds and runs on the host.
     let executable = dir.join("check");
     let built = Command::new(env!("BIARA_CLANG"))
         .args([
@@ -105,7 +135,7 @@ int main(void) {{
             "-Wall",
             "-Wextra",
             "-Werror",
-            "-fuse-ld=bfd",
+            "-fuse-ld=lld",
         ])
         .arg(&harness)
         .arg("-o")
@@ -343,7 +373,6 @@ fn corrupted_checkpoint_blocks_abort_instead_of_emitting_wrong_or_partial_code()
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn persistent_resolution_keeps_shared_memory_and_named_register_results() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("engine-shared-frame");
     fs::create_dir_all(&dir).unwrap();
@@ -381,27 +410,8 @@ __asm__(".text\n.globl frame\n.type frame,@function\nframe:\n"
 "#,
     )
     .unwrap();
-    let built = Command::new(env!("BIARA_CLANG"))
-        .args([
-            "-O2",
-            "-ffreestanding",
-            "-nostdlib",
-            "-fno-pie",
-            "-static",
-            "-fuse-ld=bfd",
-            "-funwind-tables",
-        ])
-        .arg(&source)
-        .arg("-o")
-        .arg(&binary)
-        .output()
-        .unwrap();
-    assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-    );
-    assert!(Command::new(&binary).status().unwrap().success());
+    compile(&source, &binary, &["-O2", "-funwind-tables"]);
+    check_runs(&binary);
     let image = Image::load(&binary).unwrap();
     let chosen = image.symbol("chosen").unwrap().addr;
     let database = dir.join(format!("analysis-{}.sqlite", std::process::id()));
@@ -493,22 +503,13 @@ KEEP long two(long v) { __asm__ volatile("" : "+r"(v)); return v * 2; }
 extern long (*const ops[2])(long);
 __asm__(".section .rodata\n.balign 8\n.globl ops\nops: .quad one, two\n.text\n");
 KEEP long pick(unsigned long i, long v) { return ops[i & 1](v) + 3; }
-int main(int argc, char **argv) { (void)argv; return pick(argc, 2) == 0; }
+volatile unsigned long which = 1;
+long main(void) { return pick(which, 2) == 0; }
 "#,
     )
     .unwrap();
-    let built = Command::new(env!("BIARA_CLANG"))
-        .args(["-O2", "-fno-builtin", "-fno-pie", "-no-pie", "-fuse-ld=bfd"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&binary)
-        .output()
-        .unwrap();
-    assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-    );
+    fs::write(&source, fs::read_to_string(&source).unwrap() + START).unwrap();
+    compile(&source, &binary, &["-O2"]);
     let image = Image::load(&binary).unwrap();
     let pick = image.symbol("pick").unwrap().addr;
     let site = |cfg: &biara_cfg::Cfg| {
@@ -575,7 +576,11 @@ exec "{real}" "$1" "$2" < "$fifo"
     // Two workers in 4 GiB get 1 GiB each; alone, one gets both shares. A job
     // that needs more than a share (here: dies under a 2 GB address-space
     // cap) is resolved by the retry on its own.
-    let starved = worker("starved-worker", r#"[ "$(ulimit -v)" -lt 2000000 ]"#);
+    // The cap in KiB: RLIMIT_AS, or what a macOS worker is handed instead.
+    let starved = worker(
+        "starved-worker",
+        r#"{ limit=$(ulimit -v); [ -z "$BIARA_MEMORY_LIMIT" ] || limit=$((BIARA_MEMORY_LIMIT / 1024)); [ "$limit" != unlimited ] && [ "$limit" -lt 2000000 ]; }"#,
+    );
     let cfg = recover_with_worker(&binary, &dir.join("starved.sqlite"), &starved, 2).unwrap();
     let targets = &cfg.indirect_calls[&site(&cfg)].targets;
     assert_eq!(targets.len(), 2, "{targets:?}");

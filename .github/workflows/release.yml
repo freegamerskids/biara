@@ -1,13 +1,13 @@
 name: Release
 
-# Builds the Linux x86-64 and macOS arm64 archives (binaries with their lifters) as workflow
-# artifacts for every push to main, pull request and manual run. A `v*` tag also publishes
-# them, with the GPL source of the lifters, as a GitHub release.
+# Builds the Linux x86-64 and macOS arm64 archives (binaries with their lifters) for every push
+# and manual run. A branch's latest successful build replaces the assets of its rolling
+# pre-release `build-<branch>` (what scripts/install.sh downloads, without signing in); a `v*`
+# tag publishes a versioned release. Both carry the GPL source of the lifters.
 on:
   push:
-    branches: [main]
+    branches: ['**']
     tags: ['v*']
-  pull_request:
   workflow_dispatch:
 
 # A newer commit on the same branch supersedes an unfinished build; tags always finish.
@@ -144,6 +144,48 @@ jobs:
           name: dist-${{ matrix.platform }}
           path: dist/*.tar.xz
           if-no-files-found: error
+
+  branch:
+    name: Publish the branch build
+    needs: build
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Update the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          # Keep in sync with scripts/install.sh.
+          tag=build-$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          # Stable asset names (the archives' directories keep the commit).
+          mkdir upload
+          for f in dist/*.tar.xz; do
+            cp "$f" "upload/$(basename "$f" | sed 's/^biara-[^-]*-/biara-/')"
+          done
+          (cd upload && sha256sum *.tar.xz > SHA256SUMS)
+          ls -l upload
+          notes="Latest successful build of \`$BRANCH\` ($GITHUB_SHA).
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh | sh -s -- --branch $BRANCH
+          \`\`\`"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" upload/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" \
+              -f sha="$GITHUB_SHA" -F force=true > /dev/null
+            gh release edit "$tag" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" upload/* --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "Build of $BRANCH" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+          fi
 
   publish:
     name: Publish

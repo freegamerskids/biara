@@ -1,0 +1,22 @@
+name: Branch cleanup
+
+# A deleted branch's rolling `build-<branch>` pre-release (release.yml) goes with it.
+on: delete
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Delete the branch build
+    if: github.event.ref_type == 'branch'
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.ref }}
+        run: |
+          tag=build-$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release delete "$tag" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY"
+          fi

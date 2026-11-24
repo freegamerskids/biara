@@ -1,12 +1,9 @@
 #!/bin/sh
-# Install or update biara from the latest successful Release workflow build of a branch
-# (Linux x86-64, macOS arm64):
+# Install or update biara from the latest successful build of a branch (Linux x86-64, macOS
+# arm64), which the Release workflow publishes as the pre-release `build-<branch>`:
 #
 #   curl -fsSL https://raw.githubusercontent.com/freegamerskids/biara/main/scripts/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --branch my-branch
-#
-# Builds are GitHub Actions artifacts, which GitHub serves only to signed-in users: this uses
-# the `gh` CLI when it is logged in, else a token in GH_TOKEN or GITHUB_TOKEN (curl, unzip).
 #
 # Layout: the archive unpacks into $BIARA_HOME/biara-<version>-<platform>/ (default
 # ~/.local/share/biara), `current` points at it, and the bin directory (default ~/.local/bin)
@@ -64,41 +61,15 @@ esac
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-# The archive of the latest successful Release run on $branch, into $tmp.
-download() {
-    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-        run=$(gh run list -R "$repo" --workflow release.yml --branch "$branch" --status success \
-            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
-        [ -n "$run" ] || die "no successful build of branch $branch"
-        echo "Downloading dist-$platform from run $run ($branch)"
-        gh run download "$run" -R "$repo" -n "dist-$platform" -D "$tmp/download"
-        return
-    fi
-    token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
-    [ -n "$token" ] || die "build artifacts need GitHub sign-in: run 'gh auth login', or set GH_TOKEN"
-    command -v unzip >/dev/null 2>&1 || die "unzip is required without the gh CLI"
-    api() {
-        curl -fsSL -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$repo/$1"
-    }
-    encoded=$(printf '%s' "$branch" | sed 's|%|%25|g; s|/|%2F|g; s|#|%23|g; s|&|%26|g; s|+|%2B|g')
-    # The first "id" of the response is the newest matching run's.
-    run=$(api "actions/workflows/release.yml/runs?branch=$encoded&status=success&per_page=1" |
-        grep -o '"id": *[0-9]*' | head -n 1 | grep -o '[0-9]*$' || true)
-    [ -n "$run" ] || die "no successful build of branch $branch"
-    url=$(api "actions/runs/$run/artifacts?name=dist-$platform" |
-        grep -o '"archive_download_url": *"[^"]*"' | head -n 1 | sed 's/.*"\(http[^"]*\)"$/\1/' || true)
-    [ -n "$url" ] || die "run $run has no dist-$platform artifact (expired, or that build failed)"
-    echo "Downloading dist-$platform from run $run ($branch)"
-    curl -fsSL -H "Authorization: Bearer $token" -o "$tmp/artifact.zip" "$url"
-    mkdir -p "$tmp/download"
-    unzip -q "$tmp/artifact.zip" -d "$tmp/download"
-}
-
 if [ -z "$archive" ]; then
-    download
-    for f in "$tmp"/download/biara-*-"$platform".tar.xz; do archive=$f; done
-    [ -f "$archive" ] || die "the artifact holds no biara-*-$platform.tar.xz"
+    command -v curl >/dev/null 2>&1 || die "curl is required to download a build"
+    # Keep in sync with the Release workflow's branch job.
+    tag=build-$(printf '%s' "$branch" | tr -c 'A-Za-z0-9._-' '-')
+    url=https://github.com/$repo/releases/download/$tag/biara-$platform.tar.xz
+    echo "Downloading the latest $branch build ($url)"
+    archive=$tmp/biara-$platform.tar.xz
+    curl -fSL --progress-bar -o "$archive" "$url" ||
+        die "no published build of branch $branch for $platform (none succeeded yet?)"
 fi
 [ -f "$archive" ] || die "$archive: no such file"
 

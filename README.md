@@ -95,13 +95,13 @@ to your shell's `PATH` if missing):
 ```sh
 curl -fsSL https://raw.githubusercontent.com/freegamerskids/biara/main/scripts/install.sh | sh
 biara update                     # later: the latest successful build of main
-biara update --branch my-branch  # or of another branch (its pull request's build)
+biara update --branch my-branch  # or of another branch
 ```
 
-Builds are GitHub Actions artifacts, which GitHub only serves to signed-in users: the script uses
-the [`gh` CLI](https://cli.github.com) when it is logged in (`gh auth login`), else a token in
-`GH_TOKEN`. `scripts/install.sh --help` lists its options (`--home`, `--bin`, `--archive FILE`
-for an archive you already have, `--no-modify-path`).
+Every successful build of a branch replaces the assets of its pre-release `build-<branch>` on the
+[releases page](https://github.com/freegamerskids/biara/releases), which is where the script
+downloads from (no GitHub sign-in). `scripts/install.sh --help` lists its options (`--home`,
+`--bin`, `--archive FILE` for an archive you already have, `--no-modify-path`).
 
 Tagged versions are also on the [releases page](https://github.com/freegamerskids/biara/releases);
 unpack one and run `biara` or `biara-ui` from it (the lifters sit next to them). On macOS, clear

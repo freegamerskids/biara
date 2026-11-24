@@ -64,7 +64,7 @@ enum Cmd {
     #[command(name = "__service", hide = true)]
     Service { directory: PathBuf },
     /// Replace this installation with the latest successful build of a branch
-    /// (scripts/install.sh; needs `gh auth login` or GH_TOKEN).
+    /// (scripts/install.sh).
     Update {
         /// Branch whose latest successful build to install.
         #[arg(long, default_value = "main")]

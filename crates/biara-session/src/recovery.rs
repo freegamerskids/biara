@@ -211,8 +211,9 @@ fn run(
     Ok(())
 }
 
-/// The libtcg for `arch`: `$BIARA_LIBTCG_DIR`, then next to the executable, then the
-/// workspace's build output (development).
+/// The libtcg for `arch`: `$BIARA_LIBTCG_DIR`, then next to the executable (through
+/// symbolic links, such as an installation's bin links), then the workspace's build output
+/// (development).
 pub fn find_libtcg(arch: &str) -> anyhow::Result<PathBuf> {
     if let Ok(p) = Libtcg::find(arch) {
         return Ok(p);
@@ -220,6 +221,7 @@ pub fn find_libtcg(arch: &str) -> anyhow::Result<PathBuf> {
     let name = Libtcg::file_name(arch);
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(dir) = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
         .ok()
         .and_then(|e| e.parent().map(Path::to_owned))
     {

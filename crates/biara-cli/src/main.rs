@@ -63,6 +63,13 @@ enum Cmd {
     Worker(service::WorkerArgs),
     #[command(name = "__service", hide = true)]
     Service { directory: PathBuf },
+    /// Replace this installation with the latest successful build of a branch
+    /// (scripts/install.sh; needs `gh auth login` or GH_TOKEN).
+    Update {
+        /// Branch whose latest successful build to install.
+        #[arg(long, default_value = "main")]
+        branch: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -119,10 +126,11 @@ struct LiftArgs {
     /// than keep those the ABI analysis finds preserved in SSA form.
     #[arg(long)]
     no_abi: bool,
-    /// libtcg shared library; default $BIARA_LIBTCG_DIR/libtcg-<arch>.so (.dylib on macOS).
+    /// libtcg shared library; default libtcg-<arch>.so (.dylib on macOS) in $BIARA_LIBTCG_DIR,
+    /// else next to this executable.
     #[arg(long)]
     libtcg: Option<PathBuf>,
-    /// Helper bitcode; default $BIARA_LIBTCG_DIR/helpers-<arch>.bc.
+    /// Helper bitcode; default helpers-<arch>.bc next to the libtcg.
     #[arg(long)]
     helpers: Option<PathBuf>,
     /// QEMU CPU model.
@@ -167,6 +175,7 @@ fn main() -> Result<()> {
         Cmd::EngineWorker { config } => biara_engine::worker(&config).map_err(Into::into),
         Cmd::Worker(a) => service::worker(a),
         Cmd::Service { directory } => service::execute(&directory),
+        Cmd::Update { branch } => update(&branch),
     }
 }
 
@@ -323,11 +332,12 @@ fn lift(a: LiftArgs) -> Result<()> {
         if a.link_helpers {
             let path = match &a.helpers {
                 Some(p) => p.clone(),
-                None => {
-                    let dir = std::env::var_os("BIARA_LIBTCG_DIR")
-                        .ok_or_else(|| anyhow!("--helpers or BIARA_LIBTCG_DIR required"))?;
-                    PathBuf::from(dir).join(format!("helpers-{arch}.bc"))
+                // The helper bitcode sits next to its lifter.
+                None => match &a.libtcg {
+                    Some(libtcg) => libtcg.to_owned(),
+                    None => biara_session::recovery::find_libtcg(arch)?,
                 }
+                .with_file_name(format!("helpers-{arch}.bc")),
             };
             biara_lift::link_helpers(&module, &path)?;
         }
@@ -649,6 +659,32 @@ struct DiffArgs {
     format: Format,
 }
 
+/// Run the install script that came with this installation for `branch`'s latest build.
+fn update(branch: &str) -> Result<()> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let dir = exe.parent().context("the executable has no directory")?;
+    let home = dir
+        .parent()
+        .context("the installation has no parent directory")?;
+    let script = dir.join("install.sh");
+    if !script.is_file() || !home.join("install.conf").is_file() {
+        bail!(
+            "{} is not an installation made by scripts/install.sh; install with it first",
+            dir.display()
+        );
+    }
+    let status = std::process::Command::new("sh")
+        .arg(&script)
+        .args(["--branch", branch, "--no-modify-path", "--home"])
+        .arg(home)
+        .status()
+        .context("running install.sh")?;
+    if !status.success() {
+        bail!("install.sh failed ({status})");
+    }
+    Ok(())
+}
+
 /// Load `path`, recover the whole program (entry point, symbols, unwind
 /// and function lists, code pointers), and return the image, its CFG, and
 /// the locked libtcg for its architecture.
@@ -685,7 +721,7 @@ fn recover(
     };
     let lib_path = match libtcg {
         Some(p) => p.to_owned(),
-        None => Libtcg::find(image.arch)?,
+        None => biara_session::recovery::find_libtcg(image.arch)?,
     };
     let opts = biara_lift::ResolveOptions {
         cfg: biara_cfg::Options {

@@ -88,13 +88,24 @@ Every result carries its evidence, so you can tell a proven fact from a guess.
 
 ## Install
 
-Hosts are Linux x86-64 and macOS arm64 (Apple silicon). Release archives for both are on the
-[releases page](https://github.com/freegamerskids/biara/releases); unpack one and run `biara` or
-`biara-ui` from it (the lifters sit next to them). Every commit on `main` and every pull request
-also gets both archives as artifacts of its
-[Release workflow run](https://github.com/freegamerskids/biara/actions/workflows/release.yml).
-On macOS, clear the download quarantine first:
-`xattr -dr com.apple.quarantine biara-*-arm64-macos`.
+Hosts are Linux x86-64 and macOS arm64 (Apple silicon). Install the latest successful build of
+`main` into `~/.local/share/biara`, with `biara` and `biara-ui` linked into `~/.local/bin` (added
+to your shell's `PATH` if missing):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/freegamerskids/biara/main/scripts/install.sh | sh
+biara update                     # later: the latest successful build of main
+biara update --branch my-branch  # or of another branch (its pull request's build)
+```
+
+Builds are GitHub Actions artifacts, which GitHub only serves to signed-in users: the script uses
+the [`gh` CLI](https://cli.github.com) when it is logged in (`gh auth login`), else a token in
+`GH_TOKEN`. `scripts/install.sh --help` lists its options (`--home`, `--bin`, `--archive FILE`
+for an archive you already have, `--no-modify-path`).
+
+Tagged versions are also on the [releases page](https://github.com/freegamerskids/biara/releases);
+unpack one and run `biara` or `biara-ui` from it (the lifters sit next to them). On macOS, clear
+the download quarantine first: `xattr -dr com.apple.quarantine biara-*-arm64-macos`.
 
 To build, the toolchain is pinned and fetched for you:
 
@@ -122,12 +133,8 @@ clang at the SDK before building:
 export SDKROOT=$(xcrun --show-sdk-path)
 ```
 
-`.cargo/config.toml` points the build at `.deps/`, so `cargo run` and `cargo test` just work.
-To run a built binary directly, tell it where the lifters are:
-
-```sh
-export BIARA_LIBTCG_DIR=$PWD/.deps/out
-```
+`.cargo/config.toml` points the build at `.deps/`, so `cargo run` and `cargo test` just work, and
+the built binaries find the lifters in `.deps/out` (`BIARA_LIBTCG_DIR` overrides that).
 
 ## Command line
 
@@ -137,6 +144,7 @@ biara diff  <OLD> <NEW>                # match functions between two builds by t
 biara quality <REFERENCE> <CANDIDATE>  # function and edge recall vs. a symbol-bearing oracle
 biara worker [JOB.json]                # run one JSON job (for hosting the engine)
 biara mcp   [BINARY]                   # serve one binary to an AI agent over MCP/stdio
+biara update [--branch NAME]           # reinstall from a branch's latest build (installs only)
 ```
 
 `lift` takes optional start points (an address or a symbol); with none it analyses the whole

@@ -76,10 +76,10 @@ jobs:
           [[ $GITHUB_REF_TYPE == tag ]] || version=$(git rev-parse --short HEAD)
           name=biara-$version-${{ matrix.platform }}
           mkdir -p dist/$name
-          # biara-ui and `biara mcp` find the lifters next to the executable; `biara lift`
-          # takes BIARA_LIBTCG_DIR.
+          # biara and biara-ui find the lifters next to the executable; `biara update` runs
+          # the install script that came with it.
           cp target/release/biara target/release/biara-ui .deps/out/libtcg-*.$DSO \
-            .deps/out/helpers-*.bc dist/$name/
+            .deps/out/helpers-*.bc scripts/install.sh dist/$name/
           cp -R LICENSE THIRD_PARTY_NOTICES.md README.md licenses dist/$name/
           cp patches/README.md dist/$name/LIFTERS-LICENSE.md
 
@@ -124,18 +124,18 @@ jobs:
           fi
           ls -l dist
 
-      # The unpacked archive decompiles on its own: lifters, helpers and (macOS) the
-      # bundled libraries load from it.
+      # Installed by its install script, the archive decompiles on its own: lifters, helpers
+      # and (macOS) the bundled libraries load from it through the bin links.
       - name: Smoke-test the archive
         run: |
           tmp=$(mktemp -d)
-          tar -xJf dist/biara-*-${{ matrix.platform }}.tar.xz -C "$tmp"
-          app=$(echo "$tmp"/biara-*)
+          sh scripts/install.sh --archive dist/biara-*-${{ matrix.platform }}.tar.xz \
+            --home "$tmp/home" --bin "$tmp/bin" --no-modify-path
           printf '%s\n' '__attribute__((noinline)) long triple(long x) { return x * 3 + 1; }' \
             'void _start(void) { for (;;) triple(2); }' > "$tmp/guest.c"
           .deps/llvm-23.1.2/bin/clang --target=x86_64-linux-gnu -O1 -ffreestanding -nostdlib \
             -static -fuse-ld=lld "$tmp/guest.c" -o "$tmp/guest"
-          BIARA_LIBTCG_DIR=$app "$app/biara" lift "$tmp/guest" triple --emit decomp \
+          "$tmp/bin/biara" lift "$tmp/guest" triple --emit decomp \
             --database "$tmp/db.sqlite" | tee "$tmp/out.txt"
           grep -q triple "$tmp/out.txt"
 

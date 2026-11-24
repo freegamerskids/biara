@@ -26,3 +26,10 @@ with a binary release.
 
 - **LLVM 23.1.2** (through `inkwell`, MIT): Apache-2.0 WITH LLVM-exception.
 - **inkwell**: MIT.
+- **GLib** (which the `libtcg-<arch>` lifters link): LGPL-2.1-or-later, with its dependencies
+  **PCRE2** (BSD-3-Clause) and GNU **libintl** (LGPL-2.1-or-later). Linux takes them from the
+  system. The macOS archives ship Homebrew's unmodified shared libraries next to the lifters;
+  their sources are at <https://download.gnome.org/sources/glib/>,
+  <https://github.com/PCRE2Project/pcre2> and <https://ftp.gnu.org/gnu/gettext/>.
+- **zstd** (BSD-3-Clause) and **liblzma** (0BSD): system libraries on Linux; linked statically
+  from Homebrew into the macOS binaries.

@@ -61,13 +61,6 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p biara-cli -p biara-ui
 
-      - name: Check the macOS binaries need only the system
-        if: runner.os == 'macOS'
-        run: |
-          otool -L target/release/biara target/release/biara-ui
-          ! otool -L target/release/biara target/release/biara-ui | grep -v '^target/' \
-            | grep -v -e '/usr/lib/' -e '/System/Library/'
-
       - name: Package
         run: |
           source scripts/versions.sh
@@ -81,6 +74,33 @@ jobs:
             .deps/out/helpers-*.bc dist/$name/
           cp -R LICENSE THIRD_PARTY_NOTICES.md README.md licenses dist/$name/
           cp patches/README.md dist/$name/LIFTERS-LICENSE.md
+
+          if [[ $RUNNER_OS == macOS ]]; then
+            # The lifters link Homebrew's GLib (and what it links): ship those next to them,
+            # loaded from there, and re-sign what install_name_tool changed.
+            bundle() {
+              local dep base
+              for dep in $(otool -L "$1" | tail -n +2 | awk '{print $1}' \
+                  | grep -v -e '^/usr/lib/' -e '^/System/' -e '^@'); do
+                base=$(basename "$dep")
+                if [[ ! -f dist/$name/$base ]]; then
+                  cp "$dep" "dist/$name/$base"
+                  chmod u+w "dist/$name/$base"
+                  install_name_tool -id "@loader_path/$base" "dist/$name/$base"
+                  bundle "dist/$name/$base"
+                fi
+                install_name_tool -change "$dep" "@loader_path/$base" "$1"
+              done
+              codesign --force --sign - "$1"
+            }
+            for f in dist/$name/biara dist/$name/biara-ui dist/$name/libtcg-*.dylib; do
+              bundle "$f"
+            done
+            # Everything now resolves to the system or to the archive.
+            otool -L dist/$name/biara dist/$name/biara-ui dist/$name/*.dylib
+            ! otool -L dist/$name/biara dist/$name/biara-ui dist/$name/*.dylib \
+              | grep -v '^dist/' | grep -v -e '/usr/lib/' -e '/System/Library/' -e '@loader_path/'
+          fi
           tar -C dist -cJf dist/$name.tar.xz $name
 
           # libtcg-* and helpers-*.bc are GPL binaries: ship their corresponding source

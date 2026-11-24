@@ -254,21 +254,28 @@ pub const FUNCTIONS: &[(&str, Ref)] = &[
 /// reads tables and writes data through host pointers; `exec` also lets
 /// the host run them).
 pub fn map(image: &Image, exec: bool) {
-    const PAGE: u64 = 4096;
+    // The host's pages: 16 KiB on Apple silicon.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    // Without MAP_FIXED_NOREPLACE (macOS) the address is a hint, honoured
+    // when free; the assertion below catches a taken one either way.
+    #[cfg(target_os = "linux")]
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
     let mut mapped = BTreeSet::new();
     for seg in &image.segments {
         let (start, end) = (
-            seg.addr & !(PAGE - 1),
-            (seg.addr + seg.size).next_multiple_of(PAGE),
+            seg.addr & !(page_size - 1),
+            (seg.addr + seg.size).next_multiple_of(page_size),
         );
-        for page in (start..end).step_by(PAGE as usize) {
+        for page in (start..end).step_by(page_size as usize) {
             if mapped.insert(page) {
                 let p = unsafe {
                     libc::mmap(
                         page as *mut libc::c_void,
-                        PAGE as usize,
+                        page_size as usize,
                         libc::PROT_READ | libc::PROT_WRITE | if exec { libc::PROT_EXEC } else { 0 },
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                        flags,
                         -1,
                         0,
                     )

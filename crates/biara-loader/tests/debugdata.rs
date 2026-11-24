@@ -1,12 +1,15 @@
 //! A stripped binary with Fedora-style `.gnu_debugdata` keeps its names:
 //! `foo` and `_start` come back from the XZ-compressed symtab-only ELF.
 //!
-//! The section is synthesized the way `find-debuginfo` makes it: `eu-strip
-//! -f` extracts the debug file, `xz` compresses it, `objcopy --add-section`
-//! attaches it. Requires `eu-strip`, `xz` and `objcopy` on `PATH`
-//! (binutils/elfutils; Fedora and Nobara have them).
+//! The section is synthesized the way `find-debuginfo` makes it: the debug
+//! file is split off and the binary stripped (`eu-strip -f`; here the pinned
+//! LLVM's objcopy and strip), `xz` compresses it, `objcopy --add-section`
+//! attaches it. Requires `xz` on `PATH`.
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use biara_loader::Image;
 
@@ -14,11 +17,16 @@ fn tmp() -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }
 
-fn run(prog: &str, args: &[&str]) {
+/// `llvm-objcopy`, `llvm-strip`: next to the pinned clang.
+fn llvm_tool(name: &str) -> PathBuf {
+    Path::new(env!("BIARA_CLANG")).with_file_name(name)
+}
+
+fn run(prog: &Path, args: &[&str]) {
     let status = Command::new(prog).args(args).status().unwrap_or_else(|e| {
-        panic!("{prog} missing: {e}");
+        panic!("{} missing: {e}", prog.display());
     });
-    assert!(status.success(), "{prog} {args:?} failed");
+    assert!(status.success(), "{} {args:?} failed", prog.display());
 }
 
 #[test]
@@ -33,7 +41,7 @@ fn gnu_debugdata() {
     .unwrap();
     let cc = |args: &[&str]| {
         let status = Command::new(env!("BIARA_CLANG"))
-            .arg("--target=x86_64-linux-gnu")
+            .args(["--target=x86_64-linux-gnu", "-fuse-ld=lld"])
             .args(args)
             .arg("-o")
             .arg(dir.join("prog"))
@@ -44,14 +52,13 @@ fn gnu_debugdata() {
     };
     cc(&["-O2", "-nostdlib", "-fno-pie", "-static"]);
     // The stripped binary alone has no names.
+    let (prog, debug) = (dir.join("prog"), dir.join("prog.debug"));
+    let (prog, debug) = (prog.to_str().unwrap(), debug.to_str().unwrap());
     run(
-        "eu-strip",
-        &[
-            "-f",
-            dir.join("prog.debug").to_str().unwrap(),
-            dir.join("prog").to_str().unwrap(),
-        ],
+        &llvm_tool("llvm-objcopy"),
+        &["--only-keep-debug", prog, debug],
     );
+    run(&llvm_tool("llvm-strip"), &[prog]);
     let stripped = Image::load(&dir.join("prog")).unwrap();
     assert!(stripped.symbol("foo").is_none(), "stripped binary kept foo");
     // Compress the debug file and attach it as `.gnu_debugdata`.
@@ -62,7 +69,7 @@ fn gnu_debugdata() {
     assert!(xz.status.success(), "compressing the debug file");
     std::fs::write(dir.join("prog.debug.xz"), &xz.stdout).unwrap();
     run(
-        "objcopy",
+        &llvm_tool("llvm-objcopy"),
         &[
             "--add-section",
             &format!(".gnu_debugdata={}", dir.join("prog.debug.xz").display()),
@@ -85,7 +92,7 @@ fn gnu_debugdata() {
     raw.truncate(raw.len() / 2);
     std::fs::write(dir.join("prog.debug.xz"), &raw).unwrap();
     run(
-        "objcopy",
+        &llvm_tool("llvm-objcopy"),
         &[
             "--add-section",
             &format!(".gnu_debugdata={}", dir.join("prog.debug.xz").display()),

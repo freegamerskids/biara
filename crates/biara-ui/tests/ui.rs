@@ -1,7 +1,7 @@
 //! Drive the real window state through Rune's headless runtime: keys, dialogs, clicks. Each
 //! test opens a compiled program through the full backend, so what is asserted is what a
 //! user would see happen.
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::{path::PathBuf, process::Command};
 

@@ -14,7 +14,7 @@ runs:
         sudo apt-get update -q
         sudo apt-get install -q -y --no-install-recommends \
           build-essential curl zstd xz-utils ninja-build pkg-config \
-          python3 python3-venv libglib2.0-dev elfutils \
+          python3 python3-venv libglib2.0-dev \
           zlib1g-dev libzstd-dev libxml2-dev liblzma-dev libffi-dev libxkbcommon-dev
 
     - name: System packages (macOS)

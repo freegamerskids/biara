@@ -215,7 +215,8 @@ fn optimized_and_unoptimized_declared_objects() {
                         "a spilled parameter is not an entry-register binding"
                     );
                 }
-                if arch == "x86_64" {
+                // The guest runs natively on a Linux x86-64 host only.
+                if arch == "x86_64" && cfg!(all(target_os = "linux", target_arch = "x86_64")) {
                     let result = Command::new(&path).output().unwrap();
                     assert!(result.status.success());
                     assert_eq!(result.stdout.len(), 48);
@@ -305,7 +306,7 @@ fn debug_names_cover_entry_registers_and_compressed_parity() {
     assert_eq!(names[0].register, 5); // DWARF x86-64 RDI, not the guest address.
     // Compressed sections preserve names, types, and stack objects exactly.
     let compressed = path.with_extension("names-compressed");
-    let output = Command::new("objcopy")
+    let output = Command::new(Path::new(env!("BIARA_CLANG")).with_file_name("llvm-objcopy"))
         .arg("--compress-debug-sections=zlib")
         .arg(&path)
         .arg(&compressed)
@@ -372,7 +373,7 @@ fn compressed_debug_sections_preserve_bounds() {
     let path = build("x86_64", 3, true, true);
     let original = Image::load(&path).unwrap();
     let compressed = path.with_extension("compressed");
-    let output = Command::new("objcopy")
+    let output = Command::new(Path::new(env!("BIARA_CLANG")).with_file_name("llvm-objcopy"))
         .arg("--compress-debug-sections=zlib")
         .arg(&path)
         .arg(&compressed)

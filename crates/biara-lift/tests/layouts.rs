@@ -27,7 +27,7 @@
 //! bound to the wrong function fails here even when the field exists
 //! somewhere in the module.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod layouts {
     use biara_lift::layouts::analyze_layouts;
     use inkwell::{

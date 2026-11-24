@@ -8,7 +8,7 @@
 //! Requires libtcg-aarch64.so (scripts/build-libtcg.sh x86_64 aarch64);
 //! BIARA_LIBTCG_DIR and BIARA_CLANG are set by .cargo/config.toml. Links with
 //! the toolchain's rust-lld.
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod common;
 

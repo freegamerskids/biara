@@ -13,7 +13,7 @@
 //! Requires `helpers-x86_64.bc` (`BIARA_LIBTCG_DIR`, set by
 //! `.cargo/config.toml`; `scripts/build-libtcg.sh` builds it).
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::collections::BTreeSet;
 

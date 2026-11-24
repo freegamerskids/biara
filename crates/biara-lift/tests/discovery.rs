@@ -8,7 +8,7 @@
 //! a function nothing refers to is only found through unwind information.
 //!
 //! Requires libtcg-x86_64.so and libtcg-aarch64.so (scripts/build-libtcg.sh).
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod common;
 

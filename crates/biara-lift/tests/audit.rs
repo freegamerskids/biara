@@ -4,7 +4,7 @@
 //! exactly the finding its comment names, no `ok_*` function any.
 //!
 //! Requires libtcg-x86_64.so and libtcg-aarch64.so (scripts/build-libtcg.sh).
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 #[path = "common/mod.rs"]
 mod common;
